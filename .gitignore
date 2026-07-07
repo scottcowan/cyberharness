@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+
+# Runtime state (local only)
+~/.cyberharness/
+
+# Editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
