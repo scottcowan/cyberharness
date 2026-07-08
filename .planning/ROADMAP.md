@@ -35,7 +35,11 @@ last_updated: 2026-07-08
   2. On first run, `~/.cyberharness/{sessions,queue,workspace,bench}/` are created and `config.toml` is loaded (env vars override; secrets never in TOML)
   3. A typo or missing required field in `config.toml` fails fast at startup with a clear pydantic error, not on first turn
   4. User can set mode (All Local / Wait for Online) in config and toggle it at runtime; the active mode is observable
-**Plans**: TBD
+**Plans**: 4 plans
+- [ ] 01-01-PLAN.md — uv workspace scaffold + client package + Wave 0 pytest stubs (CONF-01)
+- [ ] 01-02-PLAN.md — Config layer (pydantic-settings TOML + env override + extra=forbid) (CONF-02)
+- [ ] 01-03-PLAN.md — Paths / workspace init + status/probe subcommands + umask (CONF-03)
+- [ ] 01-04-PLAN.md — TUI wizard + MainScreen + /mode slash command + init/config CLI wire-up (CONF-04)
 
 ### Phase 2: Session Manager
 **Goal**: A user can hold a continuous, prolonged conversation with the harness whose history survives crashes, power loss, and restarts.
@@ -99,7 +103,7 @@ last_updated: 2026-07-08
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Foundation & Scaffold | 0/0 | Not started | - |
+| 1. Foundation & Scaffold | 0/4 | Planned | - |
 | 2. Session Manager | 0/0 | Not started | - |
 | 3. Router + Local Models | 0/0 | Not started | - |
 | 4. Model Evaluation | 0/0 | Not started | - |
