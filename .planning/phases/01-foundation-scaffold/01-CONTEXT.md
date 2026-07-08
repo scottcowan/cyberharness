@@ -42,8 +42,9 @@ Phase 1 delivers an installable Python project scaffold for cyberharness: monore
 
 ### First-Run Behavior
 - **D-09:** First-run sequence: detect no `config.toml` → run Textual TUI wizard (3 questions) → write `config.toml` → create workspace dirs → launch main TUI. Subsequent runs skip the wizard.
-- **D-10:** Workspace initialization is idempotent — on every startup, silently create any missing dirs under `data_dir/`: `sessions/`, `queue/`, `workspace/`, `bench/`. No prompt, no error, no warning.
+- **D-10:** Workspace initialization is idempotent — on every startup, silently create any missing dirs under `data_dir/`: `sessions/`, `queue/`, `workspace/`, `bench/`, `knowledge/`. No prompt, no error, no warning.
 - **D-11:** Partial workspace (e.g., missing `bench/`) is silently repaired. No init command required.
+- **D-12a:** `knowledge/` directory has two subdirs: `knowledge/wiki/` (project wiki, mirrors codebase structure) and `knowledge/refs/` (ingested external reference docs). Both are created on first run but start empty.
 
 ### CLI Entry Point
 - **D-12:** `cyberharness` with no subcommand launches the Textual TUI (the primary surface).
@@ -55,6 +56,16 @@ Phase 1 delivers an installable Python project scaffold for cyberharness: monore
   - `cyberharness probe` — run one connectivity check and print result
   - `cyberharness bench` — stub (Phase 4 logic); prints "Bench not yet implemented"
 - **D-15:** Mode toggle at runtime via TUI slash command: `/mode local` and `/mode online`. Updates config and takes effect immediately without restart.
+
+### Knowledge Base & CLAUDE.md
+- **D-16:** Knowledge base lives at `~/.cyberharness/knowledge/` with two subdirs:
+  - `knowledge/wiki/` — project wiki, mirrors the monorepo package structure (e.g., `wiki/packages/client/session/`, `wiki/packages/client/router/`). Each module/component gets a companion markdown file explaining its design.
+  - `knowledge/refs/` — ingested external reference docs (API specs, crawled docs, etc.) stored as markdown for offline access.
+- **D-17:** CLAUDE.md integration — each meta-harness (Cursor, Claude Code, etc.) is configured to read the workspace CLAUDE.md at its server-side path. No symlinks. The cyberharness server config maps each harness to its CLAUDE.md path. (v1.1 concern — Phase 1 just creates the `knowledge/` dir structure.)
+- **D-18:** Wiki is accessible two ways in the TUI (Phase 5 concern, capture here as design intent):
+  1. Via chat — user says "open the client session manager page" and the local model opens it in the artifact surface.
+  2. Via direct navigation — a file browser / navigation mode in the artifact surface for browsing `knowledge/wiki/`.
+  Both open the same markdown renderer in the artifact side surface.
 
 ### Claude's Discretion
 - Logging setup (stdlib `logging` with `RichHandler` is the recommendation from research — implement as appropriate)

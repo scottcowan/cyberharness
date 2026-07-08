@@ -81,6 +81,7 @@ last_updated: 2026-07-08
   3. Status bar always shows current model name, online/offline state, active mode (All Local / Wait for Online), and VRAM usage
   4. User can open a model selector and switch the active local model; the selector surfaces bench results where present
   5. Connectivity state is visually unambiguous at all times — online and offline are distinguishable at a glance
+  6. User can open a wiki page from `knowledge/wiki/` via a chat command or navigation panel in the artifact surface; markdown renders correctly
 **Plans**: TBD
 **UI hint**: yes
 
@@ -117,7 +118,7 @@ last_updated: 2026-07-08
 | Session & Conversation | SESS-01, SESS-02, SESS-03 | Phase 2 |
 | Model Routing & Connectivity | ROUT-01, ROUT-02, ROUT-03, ROUT-04, ROUT-05 | Phase 3 |
 | Model Selection & Evaluation | MODL-01, MODL-02, MODL-03, MODL-04 | Phase 4 |
-| TUI | TUI-01, TUI-02, TUI-03, TUI-04, TUI-05 | Phase 5 |
+| TUI | TUI-01, TUI-02, TUI-03, TUI-04, TUI-05, TUI-06 | Phase 5 |
 | Queue (Stub) | QUEU-01 | Phase 6 |
 
 ## Ordering Rationale

@@ -11,7 +11,7 @@ Requirements for initial release: local-first harness with Ollama/LM Studio supp
 
 - [ ] **CONF-01**: User can scaffold and install the project via `uv` with a single command on aarch64 Linux
 - [ ] **CONF-02**: User's config is loaded from `~/.cyberharness/config.toml` with env var override (secrets stay out of TOML)
-- [ ] **CONF-03**: Workspace directory structure is defined and initialized on first run (`sessions/`, `queue/`, `workspace/`, `bench/`)
+- [ ] **CONF-03**: Workspace directory structure is defined and initialized on first run (`sessions/`, `queue/`, `workspace/`, `bench/`, `knowledge/wiki/`, `knowledge/refs/`)
 - [ ] **CONF-04**: User can switch between All Local and Wait for Online mode from config and at runtime
 
 ### Session & Conversation
@@ -42,6 +42,7 @@ Requirements for initial release: local-first harness with Ollama/LM Studio supp
 - [ ] **TUI-03**: Status bar shows current model name, online/offline state, active mode (All Local / Wait for Online), and VRAM usage
 - [ ] **TUI-04**: User can open a model selector to pick and switch the active local model; selector shows bench results where available
 - [ ] **TUI-05**: Connectivity indicator provides a clear visual distinction between online and offline state at all times
+- [ ] **TUI-06**: Wiki viewer in artifact surface — user can open a `knowledge/wiki/` page via chat command ("open the session manager page") or via navigation panel; renders markdown
 
 ### Queue (Stub)
 
@@ -65,6 +66,13 @@ Deferred to future release.
 - **WORK-03**: File browser — view sandbox files (excluding .env), diff view (diff-so-fancy style)
 - **WORK-04**: Local workspace mirrors remote workspace structure; sync activates when relay connects
 - **WORK-05**: Remote server runs graphify over connected codebases
+
+### Knowledge Base
+
+- **KNOW-01**: Wiki viewer in TUI artifact surface — navigate `knowledge/wiki/` (mirrors package structure) via chat command or direct navigation panel
+- **KNOW-02**: Reference docs ingestion — fetch and store external docs (API specs, web pages) to `knowledge/refs/` for offline access
+- **KNOW-03**: CLAUDE.md auto-injection — meta-harnesses (Cursor, Claude Code, etc.) configured to read the active workspace CLAUDE.md; cyberharness server config maps each harness to its path
+- **KNOW-04**: Wiki creation flow — harness can scaffold a wiki page for any module from a template, pre-filled with the module's current structure
 
 ### GSD Integration
 

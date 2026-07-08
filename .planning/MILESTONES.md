@@ -72,6 +72,11 @@ last_updated: 2026-07-08
 - Server runs graphify over connected codebases on workspace creation and on demand
 - `GET /workspaces/{id}/graph` — returns graph data; TUI surfaces it in the artifact panel
 
+### CLAUDE.md & Meta-Harness Config
+- Server-side workspace includes a `CLAUDE.md` per workspace
+- cyberharness server config maps each meta-harness (Cursor, Claude Code, etc.) to the workspace CLAUDE.md path — each harness is configured to read it, no symlinks
+- `knowledge/wiki/` (mirrors package structure) and `knowledge/refs/` (ingested external docs) are part of every workspace; served via `GET /workspaces/{id}/knowledge/`
+
 **Phases:** ~6 phases (Phases 7–12), continuing from v1.0
 **Key dependencies:** v1.0 queue stub activates; relay client in client harness wires up
 
