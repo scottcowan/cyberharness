@@ -50,7 +50,10 @@ last_updated: 2026-07-08
   2. After every turn, the on-disk session file is atomically replaced; killing the process mid-turn never leaves a corrupt or partial session
   3. On startup, if an in-progress session exists, the user is prompted to resume or start fresh, and their choice is honoured
   4. A second harness instance cannot corrupt a session that another instance owns (filelock enforced)
-**Plans**: TBD
+**Plans**: 3 plans
+- [ ] 02-01-PLAN.md — Wave 0 test stubs + Session pydantic models with _model alias (SESS-01)
+- [ ] 02-02-PLAN.md — SessionStore: atomic write, filelock, scan_active, archive lifecycle (SESS-02)
+- [ ] 02-03-PLAN.md — SessionMgr + ResumeScreen + boot wiring (SESS-03)
 
 ### Phase 3: Router + Local Models
 **Goal**: Every conversation turn streams from a local model (Ollama or LM Studio) through a stateless router, with an explicitly minimal tool surface.
@@ -104,7 +107,7 @@ last_updated: 2026-07-08
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Foundation & Scaffold | 0/4 | Planned | - |
-| 2. Session Manager | 0/0 | Not started | - |
+| 2. Session Manager | 0/3 | Planned | - |
 | 3. Router + Local Models | 0/0 | Not started | - |
 | 4. Model Evaluation | 0/0 | Not started | - |
 | 5. TUI | 0/0 | Not started | - |
