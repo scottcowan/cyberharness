@@ -65,7 +65,11 @@ last_updated: 2026-07-08
   3. User can point the harness at a local Ollama instance and receive streaming tokens, with the model warmed via `keep_alive=-1`
   4. User can point the harness at a local LM Studio instance via a configurable OpenAI-compatible base URL and receive streaming tokens
   5. The local leader model's tool surface is explicit and minimal — no arbitrary shell, no arbitrary file I/O — enforced in code, not by convention
-**Plans**: TBD
+**Plans**: 4 plans
+- [ ] 03-01-PLAN.md — Wave 0 test stubs + to_wire() sanitiser + ToolRegistry name-param guard (ROUT-05)
+- [ ] 03-02-PLAN.md — LocalModelClient: streaming SSE, warm-up, version check, list_models (ROUT-03, ROUT-04)
+- [ ] 03-03-PLAN.md — Probe: TCP connect, N-of-M debounce, EventBus publish (ROUT-01)
+- [ ] 03-04-PLAN.md — Router: dispatch to local, cloud NotImplementedError pre-yield, phase_registry (ROUT-02)
 
 ### Phase 4: Model Evaluation
 **Goal**: A user can benchmark candidate Jetson Nano 8GB models and pick the active model informed by measured performance.
@@ -108,7 +112,7 @@ last_updated: 2026-07-08
 |-------|----------------|--------|-----------|
 | 1. Foundation & Scaffold | 0/4 | Planned | - |
 | 2. Session Manager | 0/3 | Planned | - |
-| 3. Router + Local Models | 0/0 | Not started | - |
+| 3. Router + Local Models | 0/4 | Planned | - |
 | 4. Model Evaluation | 0/0 | Not started | - |
 | 5. TUI | 0/0 | Not started | - |
 | 6. Queue Stub & Integration | 0/0 | Not started | - |
