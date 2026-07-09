@@ -83,7 +83,9 @@ last_updated: 2026-07-08
 **Open decisions:**
 - mDNS library choice for Python server (zeroconf vs python-mdns)
 - Cert management UX (auto-generated vs Let's Encrypt for Tailscale domain)
-- Workspace isolation model (Docker vs venv vs bare directory)
+- Workspace isolation model: **one container per workspace** (preferred — server is itself fully containerised, so nsjail-inside-container requires `--privileged` which negates container security; per-workspace containers via Docker-in-Docker or a sidecar container API is the correct pattern)
+- Container runtime for workspace containers: Docker socket mounted into the server container, or a sidecar like `docker:dind`, or a rootless alternative (podman, sysbox-runc for better nested container support)
+- Whether workspace containers share a base image with the server container or are independently built
 
 ---
 
@@ -105,7 +107,7 @@ last_updated: 2026-07-08
 - Tool registry: each tool tagged with minimum capability tier required
 - **Basic tier** (always available): file read (workspace files only), workspace tree listing
 - **Standard tier**: file write (workspace files), git status/diff/log, run tests
-- **Extended tier**: arbitrary shell in workspace sandbox, MCP tool calls, multi-step plans
+- **Extended tier**: arbitrary shell inside the workspace container (exec into the per-workspace container), MCP tool calls, multi-step plans
 - Tool surface presented to the model reflects the evaluated tier; harness enforces boundaries
 
 ### ACP Internal Delegation
