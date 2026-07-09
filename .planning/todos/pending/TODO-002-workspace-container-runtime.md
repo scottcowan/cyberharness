@@ -26,16 +26,26 @@ The cyberharness server runs fully containerised. Each workspace needs its own i
 
 4. **Kata Containers** — VM-based, strong isolation, but heavyweight for per-workspace use.
 
+## Key finding: sysbox coexists with Docker
+
+sysbox-runc runs alongside Docker's default runc — it does NOT replace it. Register it in `/etc/docker/daemon.json`, then use `docker run --runtime=sysbox-runc` for workspace containers. The server container itself keeps using standard runc.
+
+**Blocker:** sysbox requires host-level install. It cannot be bundled in a container image and does NOT work on managed cloud platforms (Fly.io, ECS, Render).
+
+**v1.1 is a home server** — user controls the host, so sysbox is viable. Cloud hosting is a later concern.
+
 ## Decision criteria
 
 - No `--privileged` required on the server container
-- Works on a standard cloud hosting provider (Fly, Render, AWS ECS, etc.)
 - Per-workspace container can exec arbitrary shell (extended tool tier in v1.2)
 - Reasonable startup latency (< 5s to provision a workspace container)
+- Path to cloud hosting if needed in future
 
-## Recommendation hypothesis
+## Recommendation
 
-sysbox-runc is the strongest fit if it works on the target cloud host. Docker socket passthrough is the fallback — simpler but the security trade-off needs documenting.
+**v1.1 home server:** sysbox-runc alongside Docker. Install sysbox on the home Linux host; server container uses Docker socket (or host Docker CLI); workspace containers launched with `--runtime=sysbox-runc`. Clean, no `--privileged`, proper nested container support.
+
+**If cloud hosting ever needed:** Switch to Docker socket passthrough (workspace containers as siblings) or rootless Podman inside the server container. Document the trade-off at that point.
 
 ## References
 
