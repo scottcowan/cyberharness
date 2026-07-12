@@ -178,6 +178,16 @@ last_updated: 2026-07-08
 - `code-review` — review a diff (remote-opus, readonly)
 - `summarise-session` — compress long session (local-quality)
 
+### Cross-Workspace Workflows (Inter-Project Dependencies)
+- Workspaces are project-scoped, not company-wide — each project gets its own isolated container, repo, CLAUDE.md, and secrets
+- When projects have dependencies, workflows can span workspaces: a step declares `workspace: project-name` to target a specific project's workspace
+- **Readonly cross-workspace steps** run silently — no extra approval needed (observer access)
+- **Write cross-workspace steps** require `cross_workspace: true` declaration + explicit TUI confirmation before executing
+- Step outputs flow between workspaces via `{{prev_output}}` and `{{steps.step-name.output}}` — the workflow runner handles the handoff
+- Cross-workspace steps default to readonly even if the target workspace has write permission; write must be explicitly requested
+- **ACP as the coordination layer:** each workspace exposes an ACP endpoint; the server registry makes workspaces discoverable to each other; cross-workspace dispatch goes through ACP rather than direct container exec
+- Future: workspace addresses can include a server: `workspace: cyberharness-client@node2` — enables cross-server workflows
+
 ### Workspace-Model Pairing Pattern
 Each workflow step declares both a model class and a workspace type — the two are independent trust gates:
 - **Model class** controls capability (can it reason about this task?)
