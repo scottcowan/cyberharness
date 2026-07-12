@@ -53,9 +53,18 @@ last_updated: 2026-07-08
 
 ### Workspace Provisioning
 - TUI workspace provisioning flow (GSD-style) — new workspace setup from the Cyberdeck
-- Workspace config stored server-side: git repos/worktrees, .env/auth keys, SSH keys, CLAUDE.md, MCP config
+- Workspace config (YAML, server-side only): bare git clone + named worktrees, permission level, scope paths, secret refs, MCP config, CLAUDE.md path
+- **Bare clone + worktrees:** repos stored as bare clones (`git clone --bare`); working trees added per branch on demand — no default `main` checkout unless explicitly declared
+- **Permission model (least-privilege):** each workspace declares one of `readonly | write | admin`; write workspaces declare path scope and branch patterns; admin requires explicit user approval before provisioning
 - Optional networking tools in the workspace sandbox: Tailscale, AWS CLI, gh CLI
-- `POST /workspaces` → provisions a new workspace; `GET /workspaces` → lists existing
+- `POST /workspaces` → provisions a new workspace (sysbox-runc container); `GET /workspaces` → lists existing
+
+### Secret Store
+- Node2-local secret store: SQLite + Fernet encryption (Python `cryptography` library)
+- Master key lives outside the server container (node2 env var), injected at server container start
+- Secrets tagged with minimum permission level — readonly workspaces only receive `readonly`-tagged secrets at provision time; write credentials never flow into readonly workspaces
+- `cyberharness-secrets` CLI on node2: add, rotate, list, delete secrets; never exposes plaintext over the network
+- Secrets injected as environment variables into workspace containers at provision time — never written to container filesystem
 
 ### OpenAI-Compatible Relay
 - Server exposes an OpenAI-compatible endpoint (`/v1/chat/completions`) that proxies to cloud providers (OpenAI, Anthropic)
@@ -104,11 +113,15 @@ last_updated: 2026-07-08
 - User can view the capability report and override the tier
 
 ### Expanded Tool Surface
-- Tool registry: each tool tagged with minimum capability tier required
-- **Basic tier** (always available): file read (workspace files only), workspace tree listing
-- **Standard tier**: file write (workspace files), git status/diff/log, run tests
-- **Extended tier**: arbitrary shell inside the workspace container (exec into the per-workspace container), MCP tool calls, multi-step plans
-- Tool surface presented to the model reflects the evaluated tier; harness enforces boundaries
+- Tool registry: each tool tagged with **both** a minimum capability tier (model) AND a minimum workspace permission level — both gates must pass
+- **Capability tier** (model): basic / standard / extended — determined by capability eval
+- **Workspace permission** (authorization): readonly / write / admin — declared in workspace YAML config
+- A model with extended capability in a readonly workspace still cannot write — authorization is independent of capability
+- **Basic tier + readonly**: file read, workspace tree listing, git log/diff, run queries
+- **Standard tier + write**: file write (within declared scope paths), git commit/push (within declared branch patterns), run tests
+- **Extended tier + write**: arbitrary shell inside the workspace container, MCP tool calls
+- **Extended tier + admin**: cross-workspace operations, provision/deprovision workspaces
+- **Escalation flow**: a write-level action from a readonly workspace surfaces as a TUI confirmation — user approves a scoped, time-limited escalation token rather than re-provisioning the workspace; escalation is logged in the audit trail
 
 ### ACP Internal Delegation
 - Local leader model can dispatch ACP tasks to remote agents on the server
