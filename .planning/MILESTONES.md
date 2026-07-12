@@ -82,8 +82,9 @@ last_updated: 2026-07-08
 - `GET /workspaces/{id}/graph` — returns graph data; TUI surfaces it in the artifact panel
 
 ### CLAUDE.md & Meta-Harness Config
-- Server-side workspace includes a `CLAUDE.md` per workspace
-- cyberharness server config maps each meta-harness (Cursor, Claude Code, etc.) to the workspace CLAUDE.md path — each harness is configured to read it, no symlinks
+- Workspace CLAUDE.md is a **composition** of multiple files concatenated in order — repo conventions first, workspace-specific runbooks and scope constraints after; later files override on conflict
+- Example: `[/workspace/repo/CLAUDE.md, /workspace/.workspace/HOTFIX.md]` — the hotfix file adds runbooks ("fix dropped connection bug"), scope constraints ("push only to hotfix/*"), and risk profile without duplicating the repo conventions
+- cyberharness server config maps each meta-harness (Cursor, Claude Code, etc.) to the composed CLAUDE.md — each harness reads it at its native config path
 - `knowledge/wiki/` (mirrors package structure) and `knowledge/refs/` (ingested external docs) are part of every workspace; served via `GET /workspaces/{id}/knowledge/`
 
 **Phases:** ~6 phases (Phases 7–12), continuing from v1.0

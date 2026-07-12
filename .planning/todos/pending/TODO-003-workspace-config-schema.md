@@ -51,7 +51,11 @@ mcp:
   - name: filesystem
     config: /workspace/.mcp/filesystem.json
 
-claude_md: /workspace/cyberharness/CLAUDE.md
+# CLAUDE.md composition — multiple files concatenated in order
+# Later entries override earlier ones on conflicts
+claude_md:
+  - /workspace/cyberharness/CLAUDE.md        # repo conventions (from the repo itself)
+  - /workspace/.workspace/HOTFIX.md          # workspace-specific runbooks and scope constraints
 knowledge:
   wiki_root: /workspace/knowledge/wiki
   refs_root: /workspace/knowledge/refs
@@ -72,6 +76,18 @@ knowledge:
 - Token: `{workspace_id, allowed_paths: [...], allowed_git_patterns: [...], expires_at: now+15min}`
 - Stored in memory only (not persisted); surfaced to user in TUI for approval before issuance
 - Audit log entry on issue and expiry
+
+## CLAUDE.md Composition
+
+Workspace CLAUDE.md is a list of files concatenated in order before injecting as system context. Later files override earlier ones on conflict. This allows:
+- Repo CLAUDE.md: code conventions, architecture decisions, project context
+- Workspace CLAUDE.md: operational scope constraints, runbooks for specific tasks, risk profile
+
+Example hotfix workspace CLAUDE.md content:
+- Scope declaration ("this workspace has write access to X only")
+- Runbooks for common operations (fix dropped connection bug, roll back bad router change)
+- Explicit constraints ("push only to hotfix/* branches")
+- The model reads this before acting — no need to infer safe procedures from the codebase
 
 ## Questions to resolve during Phase 8 planning
 
