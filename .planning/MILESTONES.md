@@ -52,12 +52,14 @@ last_updated: 2026-07-08
 - Auth: shared secret / token in config; no OAuth
 
 ### Workspace Provisioning
-- TUI workspace provisioning flow (GSD-style) — new workspace setup from the Cyberdeck
-- Workspace config (YAML, server-side only): bare git clone + named worktrees, permission level, scope paths, secret refs, MCP config, CLAUDE.md path
-- **Bare clone + worktrees:** repos stored as bare clones (`git clone --bare`); working trees added per branch on demand — no default `main` checkout unless explicitly declared
-- **Permission model (least-privilege):** each workspace declares one of `readonly | write | admin`; write workspaces declare path scope and branch patterns; admin requires explicit user approval before provisioning
-- Optional networking tools in the workspace sandbox: Tailscale, AWS CLI, gh CLI
-- `POST /workspaces` → provisions a new workspace (sysbox-runc container); `GET /workspaces` → lists existing
+- **Project/intent object model:** projects are first-class objects; each project contains named intents (observe, develop, hotfix, review) — the TUI workspace picker is two-level: project → intent
+- **Project config** (YAML, server-side): repo (bare clone), knowledge base, base CLAUDE.md, base image, SSH keys, MCP config, default secrets, named intents
+- **Intent** carries: human-readable description, permission level, path scope, git push patterns, model class, additional CLAUDE.md layers, additional secrets
+- TUI provisioning flow: pick project → pick intent → harness provisions sysbox-runc container → session starts with right model, CLAUDE.md, and scope already configured
+- **Bare clone + worktrees:** repos stored as bare clones; worktrees added per branch on demand, declared per intent
+- **Permission model (least-privilege):** readonly | write | admin; write intents declare scope paths and branch patterns; admin requires explicit TUI approval
+- Optional networking tools in workspace containers: Tailscale, AWS CLI, gh CLI
+- `POST /workspaces` with `{project, intent}` → provisions container; `GET /projects` → lists projects with available intents
 
 ### Secret Store
 - Node2-local secret store: SQLite + Fernet encryption (Python `cryptography` library)

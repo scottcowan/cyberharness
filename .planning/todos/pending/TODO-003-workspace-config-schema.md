@@ -9,56 +9,77 @@ files:
   - docs/workspace-config.md
 ---
 
-## Workspace Config Schema (YAML, server-side only)
+## Project/Intent Object Model
+
+Projects are first-class objects. Each project contains named intents — each intent represents what you want to do with that project (observe, develop, hotfix, review). The TUI workspace picker is two-level: project → intent.
+
+- **Project** carries: repo (bare clone), knowledge base, base CLAUDE.md, base image, default secrets
+- **Intent** carries: permission level, path scope, git push patterns, model class pairing, additional CLAUDE.md layers (runbooks/criteria), additional secrets
+- Intent name is human-readable ("hotfix", "review") — not a container ID
+- Cross-workspace workflow addressing: `workspace: cyberharness/hotfix` (project/intent)
+- Intent files (`.intents/hotfix.md`, `.intents/review.md`) live in the repo alongside the code — versioned and improvable
+
+## Project Config Schema (YAML, server-side only)
 
 ```yaml
-name: myproject
-image: cyberharness-workspace:latest
+# ~/.cyberharness/projects/cyberharness.yaml
+name: cyberharness
+description: Connectivity-aware AI harness for the Jetson Cyberdeck
+repo: git@github.com:scottcowan/cyberharness.git
+bare_path: /workspaces/cyberharness/.git-store
+base_image: cyberharness-workspace:latest
+claude_md: /workspaces/cyberharness/CLAUDE.md    # base — all intents inherit this
+knowledge:
+  wiki: /workspaces/cyberharness/knowledge/wiki
+  refs: /workspaces/cyberharness/knowledge/refs
+ssh_keys:
+  - path: ~/.ssh/id_ed25519
+    mount: readonly
+mcp:
+  - name: filesystem
+    config: /workspaces/cyberharness/.mcp/filesystem.json
+default_secrets:
+  - name: GITHUB_TOKEN
+    permission: readonly
 
-# Bare clone — no default working tree
-repos:
-  - url: git@github.com:scottcowan/cyberharness.git
-    bare_path: /workspace/.git-store
+intents:
+  observe:
+    description: Browse code, ask questions, view logs
+    permission: readonly
+    model_class: remote-sonnet
+
+  develop:
+    description: Normal development work
+    permission: write
+    scope:
+      paths: [/workspace/]
+      git: { push_pattern: "feature/*, fix/*" }
+    model_class: remote-sonnet
+    additional_secrets:
+      - name: ANTHROPIC_API_KEY
+        permission: write
+
+  hotfix:
+    description: Targeted fix with runbooks — scoped to router/ and probe/
+    permission: write
+    scope:
+      paths:
+        - /workspace/src/cyberharness/router/
+        - /workspace/src/cyberharness/probe/
+      git: { push_pattern: "hotfix/*" }
+    model_class: remote-sonnet
+    claude_md:                                   # appended after base claude_md
+      - /workspaces/cyberharness/.intents/hotfix.md
     worktrees:
       - branch: main
         path: /workspace/main
-      - branch: feature/probe-debounce
-        path: /workspace/feature-probe
 
-# Permission level: readonly | write | admin
-permission: write
-scope:
-  paths:
-    - /workspace/cyberharness/src/
-  git:
-    push_pattern: "hotfix/*"   # only branches matching this can be pushed
-
-# Secret refs — values pulled from secret store at provision time
-# Tagged by permission level — readonly workspaces only get readonly secrets
-secrets:
-  - name: ANTHROPIC_API_KEY
+  review:
+    description: Verify a change or PR — read-only, high reasoning
     permission: readonly
-  - name: GITHUB_TOKEN
-    permission: write
-  - name: AWS_ACCESS_KEY_ID
-    permission: write
-
-ssh_keys:
-  - path: ~/.ssh/id_ed25519
-    mount: readonly   # bind-mounted read-only into container
-
-mcp:
-  - name: filesystem
-    config: /workspace/.mcp/filesystem.json
-
-# CLAUDE.md composition — multiple files concatenated in order
-# Later entries override earlier ones on conflicts
-claude_md:
-  - /workspace/cyberharness/CLAUDE.md        # repo conventions (from the repo itself)
-  - /workspace/.workspace/HOTFIX.md          # workspace-specific runbooks and scope constraints
-knowledge:
-  wiki_root: /workspace/knowledge/wiki
-  refs_root: /workspace/knowledge/refs
+    model_class: remote-opus
+    claude_md:
+      - /workspaces/cyberharness/.intents/review.md
 ```
 
 ## Secret Store Design
