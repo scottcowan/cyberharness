@@ -155,7 +155,7 @@ last_updated: 2026-07-08
 ### Workflow Definition
 - YAML workflow schema: name, steps, model_class per step, conditions, on_complete
 - Python escape hatch: workflows as classes with a `@workflow` decorator for complex logic
-- Model class tags: `local-fast` (3B local), `local-quality` (7B local), `remote-standard`, `remote-extended`
+- Model class tags: `local-fast` (3B local), `local-quality` (7B local), `remote-sonnet` (balanced, default for execution), `remote-opus` (highest reasoning, for planning and verification), `remote-extended` (tool-capable tier)
 - `~/.cyberharness/workflows/` directory for user-defined workflows
 
 ### Workflow Queue
@@ -170,10 +170,21 @@ last_updated: 2026-07-08
 - Workflow run history stored in `~/.cyberharness/workflows/history/`
 
 ### Built-in Workflow Templates
-- `gsd-discuss` — discuss phase template (local-fast model)
-- `gsd-plan` — plan phase template (remote-standard model)
-- `code-review` — review a diff (remote-standard)
+- `gsd-discuss` — discuss phase template (local-fast model, readonly workspace)
+- `gsd-plan` — plan phase template (remote-opus class, planning workspace — readonly)
+- `gsd-execute` — execute phase template (remote-sonnet class, execute workspace — write, scoped)
+- `gsd-verify` — verify phase template (remote-opus class, verify workspace — readonly)
+- `gsd-hotfix` — 3-step hotfix workflow: plan (opus/readonly) → execute (sonnet/write-scoped) → verify (opus/readonly)
+- `code-review` — review a diff (remote-opus, readonly)
 - `summarise-session` — compress long session (local-quality)
+
+### Workspace-Model Pairing Pattern
+Each workflow step declares both a model class and a workspace type — the two are independent trust gates:
+- **Model class** controls capability (can it reason about this task?)
+- **Workspace permission** controls authorization (is it allowed to act?)
+- Opus-class for planning and verification (judgment); Sonnet-class for execution (throughput, cost)
+- A Sonnet-class model in a write workspace still cannot exceed the workspace's declared scope
+- An Opus-class model in a readonly workspace cannot mutate anything regardless of capability
 
 **Phases:** ~5 phases (Phases 18–22)
 **Key dependencies:** v1.2 dynamic tool surface + ACP delegation; model-class routing in the router

@@ -36,7 +36,7 @@ last_updated: 2026-07-08
   1. A valid YAML workflow file in `~/.cyberharness/workflows/` is loaded, validated against the pydantic schema, and registered at startup — a malformed file fails fast with a clear error and the line number
   2. YAML schema supports: `name`, `description`, `steps[]` (each with `prompt`, `model_class`, `tools[]`, `condition`, `on_complete`), `on_error`
   3. Python escape hatch: a class decorated with `@workflow` in `~/.cyberharness/workflows/*.py` is loaded and registered alongside YAML workflows; both appear in the same registry
-  4. Model class tags validated at load time: `local-fast`, `local-quality`, `remote-standard`, `remote-extended` are the valid values; unknown tags are rejected
+  4. Model class tags validated at load time: `local-fast`, `local-quality`, `remote-sonnet`, `remote-opus`, `remote-extended` are the valid values; unknown tags are rejected
   5. `cyberharness workflows list` shows all registered workflows with name, model classes required, and step count
 
 ### Phase 19: Model Class Routing
@@ -44,9 +44,9 @@ last_updated: 2026-07-08
 **Depends on:** Phase 18
 **Requirements:** WF-04, ROUT-07, ROUT-08
 **Success Criteria:**
-  1. Config maps model class tags to concrete models: `local-fast = "llama3.2:3b-q4"`, `remote-standard = "claude-sonnet-5"` (via server relay)
+  1. Config maps model class tags to concrete models: `local-fast = "llama3.2:3b-q4"`, `remote-sonnet = "claude-sonnet-5"`, `remote-opus = "claude-opus-4-8"` (via server relay)
   2. Queue items carry a `required_model_class` field; queue manager dispatches to the first available model of that class
-  3. If the required model class is unavailable (e.g., server offline for `remote-standard`), the item waits — harness notifies user: "Waiting for remote-standard model — connect to server to proceed"
+  3. If the required model class is unavailable (e.g., server offline for `remote-sonnet`), the item waits — harness notifies user: "Waiting for remote-standard model — connect to server to proceed"
   4. User can list what model classes are currently available from the TUI status bar (e.g., `local-fast ✓  local-quality ✓  remote-standard ✗`)
   5. "Wait for [model class]" mode: harness can be told to hold and notify when a specific class becomes available, rather than erroring
 
@@ -56,7 +56,7 @@ last_updated: 2026-07-08
 **Requirements:** WF-05, WF-06, WF-07
 **Success Criteria:**
   1. Workflow runner executes steps sequentially; each step's output is available to the next step's prompt as `{{prev_output}}`
-  2. A workflow that spans model classes (e.g., step 1 `local-fast` → step 2 `remote-standard`) transitions correctly — step 1 result is summarised and passed as context to step 2
+  2. A workflow that spans model classes (e.g., step 1 `local-fast` → step 2 `remote-sonnet`) transitions correctly — step 1 result is summarised and passed as context to step 2
   3. Workflow state is persisted after every step completion (`~/.cyberharness/workflows/history/<run_id>.json`); a harness restart resumes from the last completed step
   4. Step `condition` field: if a Python expression or model-evaluated condition is false, the runner skips to `on_complete` or a named step
   5. A failed step (model error, tool failure, timeout) triggers `on_error` behavior: retry N times, skip, or abort — never silently proceeds
@@ -78,8 +78,8 @@ last_updated: 2026-07-08
 **Requirements:** WF-08, WF-09
 **Success Criteria:**
   1. `gsd-discuss` workflow template ships and runs: one step, `local-fast`, runs a GSD-style discussion session and writes output to `.planning/`
-  2. `gsd-plan` workflow template: one step, `remote-standard`, takes a context doc as input and produces a PLAN.md
-  3. `code-review` workflow template: one step, `remote-standard`, reviews a git diff and produces a structured review
+  2. `gsd-plan` workflow template: one step, `remote-sonnet`, takes a context doc as input and produces a PLAN.md
+  3. `code-review` workflow template: one step, `remote-sonnet`, reviews a git diff and produces a structured review
   4. `summarise-session` workflow template: one step, `local-quality`, compresses a long session into a context doc
   5. Full multi-step workflow verified: `gsd-discuss` (local-fast) → `gsd-plan` (remote-standard) — runs end-to-end across model classes; context doc handoff correct; result lands in `.planning/`
 
