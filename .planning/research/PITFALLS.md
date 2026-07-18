@@ -1,303 +1,414 @@
 # Pitfalls Research
 
-**Domain:** Connectivity-aware Python async TUI + local/cloud model routing on Jetson ARM64
-**Researched:** 2026-07-07
-**Confidence:** HIGH (Textual, asyncio, httpx streaming, Ollama, Jetson) / MEDIUM (Reticulum/rnsh integration specifics)
+**Project:** warren v1.0 — Python environment broker for AI agent workspaces
+**Domain:** FastAPI container-lifecycle broker (Podman/Docker rootless), secret injection, git worktree management, NDJSON streaming, UDP peer discovery, SQLite+Fernet persistence
+**Researched:** 2026-07-12
+**Confidence:** HIGH (container lifecycle, git worktrees, Fernet, aiosqlite — well-documented failure modes); MEDIUM (Podman rootless quirks and UDP+Tailscale interaction — depend on host config)
 
 ## Critical Pitfalls
 
-### Pitfall 1: Blocking the Textual event loop with sync HTTP / file I/O
+### Pitfall 1: Leaked containers on server restart / crash
 
 **What goes wrong:**
-The TUI freezes — spinner stops, keys are ignored, screen doesn't repaint — whenever a model call, disk write, or subprocess runs. `requests`, `ollama-python`'s sync client, or `json.dump` on a large session file inside an event handler will stall the whole app.
+FastAPI process dies (SIGKILL, OOM, host reboot, `uvicorn --reload` in dev) while workspace containers are running. Containers keep executing, holding CPU/RAM/disk, but the DB row that tracked them is stale or points at a dead server. On next boot warren has no idea which containers it owns; users see duplicates, or "orphan" workspaces they cannot stop via the API.
 
 **Why it happens:**
-Textual runs on a single asyncio loop. Any blocking call in a handler or reactive watcher stalls compositor + input. Devs reach for the familiar `requests` / `openai` sync client, or write session state with plain `open().write()` inside an async handler assuming disk I/O is "fast enough."
+- Container lifetime is decoupled from the broker process — Podman/Docker outlives it, and rootless Podman has no `docker.service` to reconcile against.
+- Devs test with graceful shutdown only; they never `kill -9` the server and then start it again to see what happens.
+- The DB is treated as the source of truth without a reconcile step against the runtime.
 
 **How to avoid:**
-- Use `httpx.AsyncClient` (streaming) for both Ollama and Claude — never `requests`, never the sync `openai` client. If you want the `openai` SDK, use `AsyncOpenAI`.
-- Wrap unavoidable blocking work with `asyncio.to_thread(...)` or `loop.run_in_executor`.
-- Persist sessions via `await asyncio.to_thread(path.write_text, json.dumps(...))` or use `aiofiles`.
-- Long-running tasks belong in `App.run_worker(..., thread=False)` (async worker) — Textual's Worker API is the sanctioned pattern.
-- Never call `time.sleep` — use `await asyncio.sleep`.
+- **Deterministic labelling.** Every container gets labels `warren.workspace_id=<uuid>`, `warren.server_instance=<install_id>`, `warren.created_at=<iso>`. On boot: `podman ps -a --filter label=warren.server_instance=<id>` and cross-check against DB. Adopt survivors, mark missing rows as `state=lost`, `podman rm -f` unlabelled zombies from previous crash-loops beyond an age threshold.
+- **Startup reconciliation is a first-class subsystem**, not a nice-to-have.
+- Register a FastAPI lifespan `shutdown` hook to snapshot state — but assume it will not run and rely on labels as source of truth.
+- Set `--restart=no` on containers so a host reboot does not silently resurrect them.
 
 **Warning signs:**
-- Cursor freezes for >100ms while streaming a token.
-- Ctrl+C doesn't respond during model calls.
-- `textual console` shows long gaps between log messages.
-- Async task warnings: `coroutine was never awaited` or `Task was destroyed but it is pending`.
+- `podman ps -a | wc -l` grows monotonically across dev sessions.
+- Users report "I stopped that workspace an hour ago, why is the CPU still pegged?"
+- DB has more `state=running` rows than `podman ps` returns.
 
-**Phase to address:**
-Phase 1 (TUI + probe scaffold) — establish async-only I/O convention before any model integration.
+**Phase to address:** Phase 1 (Runtime foundation) — labelling + reconcile loop before workspace #2.
 
 ---
 
-### Pitfall 2: Not stripping `_model` and other harness-internal fields before HTTP send
+### Pitfall 2: Orphaned child processes inside containers (PID 1 problem)
 
 **What goes wrong:**
-Ollama accepts unknown message keys silently; Claude / OpenAI-compatible endpoints reject with 400 `Unexpected keyword` or, worse, some proxies pass them through and they end up billed as tokens. Also breaks when re-serialising a session that has been round-tripped through the API.
+Sidecar spawns subprocesses (git, python, the agent itself). Sidecar dies. Children reparent to PID 1. If PID 1 is `bash` or your sidecar without proper signal handling, zombies pile up, `podman stop` hangs 10s then SIGKILLs, and file locks are not released cleanly.
 
 **Why it happens:**
-The session design explicitly stores `_model` on each assistant message (docs/session-design.md:38). Devs forget the sanitisation step because Ollama tolerates it during local dev, then it blows up the first time a cloud drain runs.
+Container PID 1 has special semantics: default signal handlers are not installed, and PID 1 must reap children. Most Python scripts do neither. Podman/Docker's `--init` flag fixes this via `tini`, but it is easily forgotten.
 
 **How to avoid:**
-- Single choke-point: `to_wire(messages)` function that returns a deep-copied list with only `{role, content, name?, tool_calls?}` keys. Every outbound HTTP call goes through it.
-- Unit test that asserts no `_`-prefixed keys and no unknown keys survive `to_wire`.
-- Consider a `Message` dataclass with an explicit `.to_wire()` method rather than raw dicts.
+- Always run containers with `--init` — puts `tini` at PID 1.
+- If `--init` is unavailable (e.g. under nsjail), the sidecar must install `signal.signal(SIGCHLD, reap)` and forward SIGTERM/SIGINT to children.
+- Spawn subprocesses with `Popen(..., start_new_session=True)` and kill the whole process group on shutdown (`os.killpg`).
 
 **Warning signs:**
-- Claude API returns `invalid_request_error` on the first queue drain.
-- Token counts higher than expected on cloud calls.
+- `podman stop <c>` consistently takes ~10 seconds.
+- `ps -ef` inside container shows `<defunct>` entries.
+- Agent commands return but their spawned processes keep running.
 
-**Phase to address:**
-Phase 2 (Router + Ollama client) — bake the sanitiser in from turn one.
+**Phase to address:** Phase 1 (Runtime foundation) — bake `--init` into the runtime wrapper.
 
 ---
 
-### Pitfall 3: Torn/corrupt session JSON on crash mid-write
+### Pitfall 3: Secrets leaking via `podman inspect`, `/proc/*/environ`, and logs
 
 **What goes wrong:**
-Power loss, SIGKILL, or a crash mid-`write()` leaves `~/.cyberharness/sessions/<id>.json` truncated or half-written. On next startup the resumption code hits `json.JSONDecodeError` and either crashes or (worse) silently drops the session.
+Secret injection via `-e FOO=$SECRET` or `--env-file` writes plaintext into container metadata that `podman inspect <c>` returns verbatim. It also appears in `/proc/<pid>/environ` on the host (readable by the same UID). If warren logs the subprocess argv, or FastAPI middleware logs request bodies, the plaintext secret lands in `journalctl`/stdout. Any operator running `ps auxe` sees them.
 
 **Why it happens:**
-Session is persisted after every turn (docs/session-design.md:9). Devs use `path.write_text(json.dumps(...))` — which under the hood is truncate-then-write, not atomic. On Jetson especially, sudden power loss during battery swap / hard reset is a realistic failure mode.
+- Env vars are the path of least resistance — SDKs literally offer `environment={...}`.
+- Debug `logger.info(f"launching {cmd}")` added in Phase 1 is often forgotten.
+- FastAPI's access log default is safe, but Sentry, request-logging middlewares, and error handlers commonly capture bodies.
 
 **How to avoid:**
-- Atomic write pattern: write to `<id>.json.tmp` in the same directory, `fsync`, then `os.replace(tmp, final)`. `os.replace` is atomic on POSIX.
-- Optionally keep a `<id>.json.bak` rotated on each successful write; recovery falls back to it on parse failure.
-- Consider append-only journal (JSON Lines) of turns as the source of truth, with the aggregated JSON as a derived snapshot. Rebuild snapshot from journal on corruption.
-- Wrap load in `try/except JSONDecodeError` — never let a bad session brick startup. Move corrupt files to `sessions/corrupt/` and log.
+- **Prefer tmpfs-mounted secret files** where the workload can read a path: `--mount type=tmpfs,dst=/run/secrets` + write files with `0400` perms via a small init step. Mirrors Docker/Podman secret semantics.
+- If env vars are unavoidable, use `--env-file <path>` on a tmpfs and delete the file immediately after start. (Note: still visible in `inspect`; container's copy remains.)
+- **Redacting log formatter**: hash any value whose key matches `(secret|token|key|password|api)` before emit.
+- Never log full subprocess argv — log `argv[0]` and a redacted arg count.
+- Disable body-capturing middleware on endpoints accepting secrets.
+- Document: `podman inspect` output is a secret-bearing artefact — do not paste in bug reports.
 
 **Warning signs:**
-- Any user report of "lost my session after a reboot."
-- `JSONDecodeError` in logs.
-- Session files with size 0 or ending mid-token.
+- `grep -r "AKIA\|sk-\|ghp_" /var/log` returns hits.
+- `podman inspect <c> | jq .Config.Env` shows anything sensitive in plaintext.
+- Any secret ever appears in Sentry, a crash report, or a screenshot.
 
-**Phase to address:**
-Phase 3 (Session manager) — atomic writes are non-negotiable from v1.
+**Phase to address:** Phase 2 (Secret management) — before any real credential is injected. Add a test asserting a known-secret token never appears in captured logs.
 
 ---
 
-### Pitfall 4: Connectivity flapping causes queue drain thrash
+### Pitfall 4: Podman rootless — user namespace exhaustion (subuid/subgid limits)
 
 **What goes wrong:**
-On marginal WiFi / mobile hotspot / LoRa, the probe rapidly toggles `connected`/`disconnected`. Every rising edge kicks off `queue.drain()`, which starts a Claude request, which fails mid-stream when connectivity drops, which increments `attempts`, which retries immediately on the next rising edge. Queue attempts explode; Claude bills for aborted streams; user sees "burst of half-answers."
+Rootless Podman uses `/etc/subuid` and `/etc/subgid` to map container UIDs. Default allocation is 65536 IDs per user. Container images requesting high in-container UIDs, or `--userns=keep-id` combined with high UIDs, fail at container-create with `newuidmap: write to uid_map failed: Invalid argument` or `numerical result out of range`.
 
 **Why it happens:**
-The probe is a boolean edge trigger (docs/architecture.md:27). Real-world connectivity is a distribution, not a boolean. Naive edge triggering is the classic mistake.
+- Default 65536 is often enough for one image but not many.
+- Some cloud-init'd VMs do not populate `/etc/subuid` for non-login users at all → rootless Podman refuses to start.
 
 **How to avoid:**
-- Debounce: require N consecutive successful probes before declaring `connected` (e.g., 2 out of 2, or an EWMA over 3 samples). Same for `disconnected`.
-- Single-flight drain: an `asyncio.Lock` around `queue.drain()` so at most one drainer runs. New `connected` events while draining are ignored (or queued as a single re-check flag).
-- Exponential backoff on the *envelope*, not just the connection. If envelope attempts >= 3, don't retry until probe has been stably connected for M minutes.
-- Idempotency: the router must be able to detect "this envelope was partially processed" — persist request ID before sending, check server for completion on retry (Anthropic supports `Idempotency-Key`).
-- Probe target should be robust: don't probe `1.1.1.1` only via ICMP (blocked on many networks) — do a TCP connect to `1.1.1.1:443` or an HTTPS HEAD to a small endpoint. Better still: probe the *actual* endpoint you'll call (`api.anthropic.com`) — you can be "online" and still have Anthropic unreachable.
+- Preflight on server boot: `podman info --format '{{.Host.IDMappings}}'`, verify ≥ 65536, refuse to start with a clear error otherwise.
+- Document `usermod --add-subuids 100000-165535 --add-subgids 100000-165535 <user>` in setup script.
+- Prefer container images that stay in low UID space (< 65536). Log a WARN if `--userns=keep-id` is used.
+- Set `storage.conf`'s `runroot`/`graphroot` to a path with plenty of inodes — not `/tmp`.
 
 **Warning signs:**
-- `attempts` field in queue envelopes climbing rapidly.
-- Duplicate assistant responses appearing in session history.
-- Anthropic billing shows many short streams.
+- Errors mentioning `newuidmap`, `slirp4netns`, or `cannot set up userns`.
+- Works for user A, fails for user B on the same host.
 
-**Phase to address:**
-Phase 4 (Queue + probe integration) — debounce + single-flight are day-one features, not polish.
+**Phase to address:** Phase 1 (Runtime foundation).
 
 ---
 
-### Pitfall 5: Streaming response parsing that assumes complete SSE frames
+### Pitfall 5: Podman rootless — overlay storage silently falling back to `vfs`
 
 **What goes wrong:**
-The router reads `async for chunk in response.aiter_bytes()` and tries to parse each chunk as a JSON delta. On real networks, a single SSE `data: {...}\n\n` frame arrives split across two chunks, or two frames arrive concatenated in one chunk. Parser raises `JSONDecodeError`, stream is aborted, user sees a truncated response, envelope retries.
+Rootless Podman defaults to overlay storage in `~/.local/share/containers/storage`. If `$HOME` is on NFS/ecryptfs/ZFS-without-config, or `fuse-overlayfs` is missing, Podman silently falls back to `vfs`, which copies the entire image on every layer — 10-100× slower and eats disk. Or it fails to start.
 
 **Why it happens:**
-Both Ollama's `/api/chat` (NDJSON) and Anthropic's messages API (SSE `event:`/`data:` pairs) stream frame-by-frame, but TCP does not preserve frame boundaries. Devs test on localhost where a chunk == a frame and ship.
+- `fuse-overlayfs` is not installed on minimal distros.
+- Kernel < 5.11 without `fuse-overlayfs` cannot do rootless overlay natively.
 
 **How to avoid:**
-- Use `response.aiter_lines()` for Ollama NDJSON — httpx handles the line buffering.
-- For Anthropic SSE, use `httpx-sse` or the official `anthropic` Python SDK's `client.messages.stream()` which handles reassembly.
-- If rolling your own SSE: buffer bytes, split on `\n\n`, keep the tail for the next iteration.
-- Always handle `[DONE]` sentinel (OpenAI-compat) or `message_stop` event (Anthropic) explicitly — don't rely on stream close.
-- Test with `httpx-mock` injecting fragmented chunks; test with `tc qdisc` adding latency/loss.
+- Preflight: check `podman info --format '{{.Store.GraphDriverName}}'` — refuse to start on `vfs` unless explicitly opted in.
+- Install `fuse-overlayfs` as a hard setup dep.
+- Allow `WARREN_STORAGE_ROOT` to point graph store at a known-good path (e.g. `/var/lib/warren-storage`).
 
 **Warning signs:**
-- Truncated responses on cellular/LoRa but fine on WiFi.
-- Intermittent `JSONDecodeError` in stream handler.
-- Last few tokens missing from persisted messages.
+- Container start times measured in minutes.
+- Disk usage of `~/.local/share/containers` balloons past image_sum × N.
+- `podman info` reports `graphDriverName: vfs`.
 
-**Phase to address:**
-Phase 2 (Router / Ollama client) for local streaming; Phase 5 (Claude integration) for SSE.
+**Phase to address:** Phase 1 (Runtime foundation).
 
 ---
 
-### Pitfall 6: Handoff summarisation loses critical context silently
+### Pitfall 6: Rootless port-binding failures and slirp4netns performance cliff
 
 **What goes wrong:**
-Local Llama 3.2 3B is asked to summarise a 30-turn discuss session into a context doc. It hallucinates decisions, drops constraints, or paraphrases user requirements into something subtly wrong. The plan phase runs on Claude using this doc, produces a great plan for the wrong problem, and the user only notices at execute or verify time.
+Rootless containers cannot bind ports < 1024 without host-level tweaks. `-p 80:8080` silently fails. Rootless default networking is slirp4netns, which adds ~2× latency and ~10× throughput hit vs. host networking — often unnoticed until file transfers or large streams get sluggish.
 
 **Why it happens:**
-A 3B quantised model summarising freeform discussion is genuinely unreliable at edge cases. Users assume "summarisation is easy" because it looks fluent. There's no diff/review step — the doc goes straight to the queue.
+`net.ipv4.ip_unprivileged_port_start=1024` on most distros. slirp4netns is user-mode TCP/IP.
 
 **How to avoid:**
-- Structured summarisation prompt with strict schema (Phase Goal / Decisions / Open Questions / Constraints) — reject and retry if output doesn't parse.
-- Include raw user turns *verbatim* in the "Requirements" section — don't paraphrase user statements, only the assistant's clarifications.
-- **User confirms the context doc before enqueue.** Show the doc in the TUI with an [approve / edit / regenerate] prompt. This is the single most important safeguard.
-- Log both raw messages and generated doc — recovery = re-summarise or hand-edit.
-- Consider a larger local model for summarisation specifically (e.g., a 7-8B if the Jetson has headroom) even if 3B handles the chat.
+- Publish only on high ports (≥ 10000). Warren's proxy handles any low-port façade.
+- Document `sysctl net.ipv4.ip_unprivileged_port_start=443` if truly needed.
+- For sidecar streams, prefer Unix domain sockets on a shared volume over TCP where possible.
+- Consider `--network=pasta` (Podman 4.4+) for better rootless throughput than slirp4netns.
 
 **Warning signs:**
-- Plan phase output references things user never said.
-- User reports "that's not what we discussed."
-- Context docs shorter than ~200 words on 20+ turn sessions.
+- `Error: rootlessport cannot expose privileged port 80`.
+- Intra-host bandwidth < 100 Mbps.
 
-**Phase to address:**
-Phase 3 (Session manager summarisation) — confirmation UX must be in v1.
+**Phase to address:** Phase 3 (Networking/proxy).
 
 ---
 
-### Pitfall 7: Ollama model not loaded / cold start blocking first turn
+### Pitfall 7: Bare git clone corruption via concurrent worktree operations
 
 **What goes wrong:**
-User types first message → 15-45s of silence while Ollama loads `llama3.2:3b-instruct-q4_K_M` into VRAM. UI appears frozen (see also Pitfall 1). On Jetson Orin Nano with limited VRAM, model may be evicted between sessions and reload every time. Worse: if VRAM is exhausted, Ollama silently falls back to CPU and inference goes from 40 tok/s to 3 tok/s.
+Two worktrees created from the same bare clone run `git fetch` simultaneously, or one runs `git gc` while another is mid-checkout. Result: half-written `.pack` files, corrupted `packed-refs`, stale `index.lock` after a crash, worktree metadata pointing at deleted branches. Recovery ranges from `git worktree prune` + `git worktree repair` to a full reclone.
 
 **Why it happens:**
-Ollama unloads models after `keep_alive` (default 5min). Jetson memory pressure from other processes can force eviction sooner. Devs test in a hot loop where the model stays loaded, then real users hit cold starts.
+- Git assumes a single writer per repo. `git worktree` shares the object DB across workers but does not add locking beyond `index.lock`.
+- `git gc --auto` fires opportunistically and can conflict with concurrent fetches.
+- SIGKILL during `git fetch`/`git checkout` leaves stale `.lock` files that clear only manually.
 
 **How to avoid:**
-- Warm on startup: fire an empty completion or `POST /api/generate` with `keep_alive: -1` at harness launch (in background, non-blocking).
-- Show explicit "loading model..." state in TUI with elapsed timer — silence is worse than a slow spinner.
-- Set `OLLAMA_KEEP_ALIVE=24h` or `-1` in the systemd unit for the local phases model.
-- Check `/api/ps` (Ollama endpoint listing loaded models) on startup, warn if using CPU instead of GPU.
-- Pre-pull models in Phase 0 install script — never fetch multi-GB models on first run over cellular.
-- Jetson-specific: pin Ollama to GPU (`CUDA_VISIBLE_DEVICES=0`), verify `nvidia-smi` shows the process.
+- **Serialise writes to the bare repo** via an asyncio Lock keyed by repo path. Reads/checkouts inside a worktree are safe concurrently — only fetch/gc/prune need the global lock.
+- Disable auto-gc on bare repos: `git config gc.auto 0`, run `git gc` on a scheduled job under the lock.
+- Never `rm -rf` a worktree directory — always `git worktree remove <name>` (removes metadata too). If the directory is already gone, `git worktree prune`.
+- On workspace destroy: `git worktree remove --force <path>` first, then `rm -rf` any residue.
+- Store bare repos on a local filesystem — never NFS/SMB (fcntl locks unreliable).
 
 **Warning signs:**
-- First turn of a session much slower than subsequent turns.
-- `ollama ps` shows model not resident.
-- Inference speed < 10 tok/s on Jetson Orin.
+- `error: unable to read <sha>` or `bad object` on fetch.
+- `fatal: '<path>' is already checked out at '<other>'` — stale worktree metadata.
+- `.lock` files older than a few seconds in `.git/`.
 
-**Phase to address:**
-Phase 2 (Ollama integration) + Phase 0 (install script).
+**Phase to address:** Phase 4 (Git/workspace management).
 
 ---
 
-### Pitfall 8: Sessions directory grows unbounded
+### Pitfall 8: NDJSON stream buffering — the "live output arrives in bursts" problem
 
 **What goes wrong:**
-Every phase creates a session file that's never cleaned up. After 6 months of use `~/.cyberharness/sessions/` has 10k JSON files. Startup scan (docs/session-design.md:65) walks all of them looking for `state: active`, taking 30s and burning battery. On Jetson's SD card this also risks wear-out.
+Sidecar writes NDJSON events with `print(json.dumps(evt))`. Python buffers stdout in 4-8 KB blocks when not attached to a TTY. Client sees nothing for 30 seconds, then a burst. Add a reverse proxy (nginx/Traefik) and it re-buffers. Add gzip and it gets worse.
 
 **Why it happens:**
-"Resumable sessions" implies retention. No archive/rotation policy is specified in the design.
+- Python `sys.stdout` is line-buffered on TTY, block-buffered on pipes.
+- FastAPI/Starlette's `StreamingResponse` flushes per yield, but middlewares like `GZipMiddleware` buffer the entire response.
+- Nginx/Traefik default to proxy buffering.
 
 **How to avoid:**
-- Explicit archive step on `complete()`: move to `sessions/archive/YYYY-MM/` — startup only scans the root dir.
-- Or maintain `~/.cyberharness/sessions/index.json` with `{id, state, phase, mtime}` — scan the index, not the filesystem. Rebuild index on corruption.
-- Retention policy: archived sessions gzip'd after 30 days, deleted after 180 (configurable).
-- Track directory size in probe/health check; warn on TUI when > threshold.
+- Sidecar: `python -u` or `PYTHONUNBUFFERED=1`; explicit `sys.stdout.flush()` after every event. Better: write bytes directly (`os.write(1, line)`).
+- Server: `StreamingResponse(content_type="application/x-ndjson")`; exclude stream routes from GZipMiddleware.
+- Set headers: `X-Accel-Buffering: no` (nginx), `Cache-Control: no-cache`.
+- Use HTTP/1.1 chunked transfer; verify HTTP/2 frame flushing end-to-end before adopting.
+- Emit heartbeat events every ~15s so idle connections survive middlebox timeouts (typically 30-60s).
 
 **Warning signs:**
-- Startup time creeping up over weeks.
-- `ls ~/.cyberharness/sessions | wc -l` in the thousands.
+- Events arrive in bursts, not smoothly.
+- Time-to-first-byte > 1s.
+- Long-running commands appear to hang, then dump everything at once.
 
-**Phase to address:**
-Phase 3 (Session manager) — index or archive from v1, or you'll eat this later.
+**Phase to address:** Phase 3 (Streaming/proxy).
 
 ---
 
-### Pitfall 9: API keys leaked into session files / logs / queue envelopes
+### Pitfall 9: NDJSON reconnection loses events (no resume semantics)
 
 **What goes wrong:**
-Full request payload including `Authorization: Bearer sk-ant-...` gets logged in debug mode, or the router serialises the whole `httpx.Request` object into the session's `model_log`. Session files are then synced to a repo, pasted into a bug report, or committed as a fixture.
+Client's HTTP connection drops mid-stream (WiFi flap, proxy idle timeout, laptop lid close). Sidecar keeps emitting; when the client reconnects, everything between disconnect and reconnect is gone. Or worse: reconnect spawns a second consumer on the same sidecar stream, interleaving events.
 
 **Why it happens:**
-Devs log request objects for debugging. Session `model_log` is under-specified in the design (docs/architecture.md:53). Anthropic keys are long-lived and high-privilege.
+NDJSON has no built-in resume (unlike SSE's `Last-Event-ID`). HTTP request/response is not a session.
 
 **How to avoid:**
-- Never log request headers. `httpx` event hooks: strip `Authorization` before logging.
-- Config file `~/.cyberharness/config.toml` should never contain the key — read from env var (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) or system keyring (`python-keyring`).
-- `model_log` schema is explicit: `{model, tokens_in, tokens_out, latency_ms, timestamp}` — no raw request/response objects.
-- Add a pre-commit hook and CI check scanning `~/.cyberharness/**/*.json` (in fixtures / test data) for `sk-` prefixes.
-- Rotate keys on any suspicion.
+- Assign each event a monotonic `seq` per workspace; buffer the last N (e.g. 1000) in warren-server memory or an aiosqlite events table.
+- Reconnect endpoint accepts `?since=<seq>` and replays.
+- Enforce single-consumer per sidecar stream — warren-server multiplexes; sidecar always talks to warren.
+- Consider SSE (`text/event-stream`) if the client is a browser — `EventSource` reconnect is free.
+- Client-side ack ("processed up to seq N") allows warren to drop older buffered events.
 
 **Warning signs:**
-- Any `sk-` string appearing in `grep -r ~/.cyberharness`.
-- Debug logs containing headers.
+- After a brief network blip, users see truncated command output.
+- Events observed twice or interleaved.
 
-**Phase to address:**
-Phase 5 (Claude integration) — but the pattern (keyring + env) should be set in Phase 0.
+**Phase to address:** Phase 3 (Streaming/proxy) — retrofit is painful.
 
 ---
 
-### Pitfall 10: ARM64 wheel gaps break `pip install` on Jetson
+### Pitfall 10: UDP peer discovery — Docker/Podman bridges "steal" broadcasts
 
 **What goes wrong:**
-`pip install cyberharness` on Jetson (aarch64) tries to install a dependency (common offenders: `pydantic-core`, `tiktoken`, `orjson`, `cryptography`, `numpy`, older `httptools`) that has no aarch64 wheel on PyPI. Pip falls back to source build, which needs Rust / C compilers, may take 20+ minutes, and often fails on Jetson's default JetPack Python.
+Warren advertises `255.255.255.255:<port>` for LAN peer discovery. On a host with Docker/Podman up, default bridges (`docker0`, `cni-podman0`) sit on `172.x/16`. The broadcast goes out the wrong interface, or the listener bound to `0.0.0.0` picks up its own broadcast from every bridge — duplicate "peer" records and loops.
 
 **Why it happens:**
-Jetson runs Ubuntu-on-aarch64 with a system Python that's usually behind PyPI's supported versions. Some maintainers ship x86_64 + arm64 macOS wheels but skip Linux/aarch64.
+- Linux routes `255.255.255.255` by kernel routing-table order — not necessarily the user's LAN.
+- A `0.0.0.0`-bound listener receives every interface's broadcast, including bridge subnet broadcasts (`172.17.255.255`).
 
 **How to avoid:**
-- Pin to Python versions with best aarch64 wheel coverage — currently 3.11 or 3.12 (3.13 aarch64 wheel coverage is still catching up as of mid-2026; verify per-dep). Use `pyenv` or `uv` rather than JetPack's system Python.
-- Prefer `uv` for install — faster resolution + clearer errors on missing wheels.
-- Test dependency install on a Jetson (or `docker run --platform linux/arm64`) in CI before every release.
-- Vendor a `requirements-jetson.txt` with known-good pinned versions.
-- Avoid heavy deps entirely where possible: `httpx` over `aiohttp` (both fine on aarch64 but httpx has fewer C deps); `msgspec` or stdlib `json` over `orjson` if orjson wheel is missing for your Python version.
-- NVIDIA's own `jetson-containers` project publishes prebuilt images with common ML deps — piggyback.
+- Enumerate interfaces via `psutil.net_if_addrs()` or `netifaces`; filter out `docker*`, `cni-*`, `podman*`, `br-*`, `veth*`, `lo`.
+- Send subnet-directed broadcasts (e.g. `192.168.1.255`) instead of `255.255.255.255` — routes cleanly out one interface.
+- Bind the listener to a specific interface IP, not `0.0.0.0`, or filter incoming packets by source subnet.
+- De-dupe peers by an install UUID in the advertisement payload — not by `(ip, port)`, since one host may appear via multiple interfaces.
 
 **Warning signs:**
-- `pip install` output shows `Building wheel for X (pyproject.toml)` for anything non-trivial.
-- Install takes > 2 minutes.
-- CI passes on Linux x86_64 but user reports failure on hardware.
+- Warren "discovers itself" as a peer.
+- Peers on the same LAN cannot see each other; peers on different LANs appear via VPN.
+- Discovery works with Docker stopped, breaks when Docker starts.
 
-**Phase to address:**
-Phase 0 (project scaffolding) — dependency choices are hard to reverse.
+**Phase to address:** Phase 6 (Peer discovery) — interface selection as a config surface from day 1.
 
 ---
 
-### Pitfall 11: Textual `App.exit()` leaving background workers running
+### Pitfall 11: UDP discovery advertising Tailscale/VPN addresses
 
 **What goes wrong:**
-User hits `q` to quit. The TUI closes but the queue drain worker is mid-stream to Claude. The Python process hangs (asyncio tasks pending), or worse, Ctrl+C corrupts the session mid-write (see Pitfall 3). On next launch the "active" session is stale.
+Tailscale creates `tailscale0` on `100.64.0.0/10`. Warren advertises "connect me at <first non-loopback IPv4>" and picks the tailnet address. LAN peers try to route to `100.64.x.x` and fail unless they are also on the tailnet.
 
 **Why it happens:**
-Textual's `App.exit()` cancels the app but doesn't automatically await background tasks the app has spawned outside its Worker API. Devs spawn `asyncio.create_task()` directly and forget the cancellation path.
+- Interface order is non-deterministic on Linux.
+- `socket.gethostbyname(socket.gethostname())` is notoriously unreliable — often returns `127.0.1.1` or the tailnet address.
 
 **How to avoid:**
-- All background work via `App.run_worker()` — Textual will cancel workers on exit.
-- Register an `on_unmount` / shutdown hook that: sets a shutdown event, awaits in-flight streams to reach a safe cancel point, flushes session snapshot, then exits.
-- In-flight streams should periodically check `asyncio.current_task().cancelled()` and persist a partial-response marker so replay knows to re-request.
-- Handle SIGTERM (systemd stop) the same as `q` — don't rely on Textual's key binding alone.
+- Explicit config: `WARREN_ADVERTISE_IFACE=eth0` or `WARREN_ADVERTISE_IP=192.168.1.42`.
+- Auto-detect: respond on the interface the incoming discovery message arrived on (packet source-based).
+- Exclude interface prefixes: `tailscale*`, `wg*`, `zt*`, `tun*`, `tap*` from LAN broadcast scope; treat them as separate discovery scopes.
+- On the tailnet, use MagicDNS + `tailscale status --json` for service discovery — UDP broadcasts do not cross the tailnet anyway.
 
 **Warning signs:**
-- `q` doesn't return to shell for several seconds.
-- Sessions occasionally stuck in `state: active` with no matching process.
-- Pending task warnings on shutdown.
+- Peers announce a `100.64.x.x` IP to LAN peers.
+- Warren works over Tailscale or LAN but not both simultaneously.
 
-**Phase to address:**
-Phase 1 (TUI scaffold) — set the pattern before workers proliferate.
+**Phase to address:** Phase 6 (Peer discovery).
 
 ---
 
-### Pitfall 12: Retry storm on 429 / 529 from Anthropic
+### Pitfall 12: aiosqlite connection-per-request thrash and writer contention
 
 **What goes wrong:**
-Anthropic returns 429 (rate limit) or 529 (overloaded). Naive retry-immediately or fixed-backoff hammers the API, gets the account rate-limited harder, and cascades: every queue envelope now blocked, user's session drain stalls entirely.
+Devs write `async with aiosqlite.connect(db_path) as db: ...` inside every request handler. SQLite has a single writer — under load, `sqlite3.OperationalError: database is locked` fires unpredictably. Even without contention, `PRAGMA journal_mode=WAL`, `foreign_keys=ON`, `busy_timeout` must be set per connection and are lost on close.
 
 **Why it happens:**
-Exponential backoff sounds simple until it isn't. Devs implement `sleep(2**attempt)` but skip jitter, skip Retry-After header, and share no state across envelopes.
+aiosqlite is a thin async wrapper — no built-in pool. FastAPI tutorials copy-paste Postgres patterns that assume server-side concurrency.
 
 **How to avoid:**
-- Respect `retry-after` header verbatim (both `429` and `529` may include it).
-- Exponential backoff **with full jitter**: `sleep(random.uniform(0, min(cap, base * 2**attempt)))`.
-- Circuit breaker at the router level: after N consecutive 429/529s, freeze all cloud calls for a cooldown window (e.g., 5 min) and surface the state to the TUI.
-- Distinguish retryable (429, 5xx, network) from non-retryable (400, 401, 403). Non-retryable → dead-letter, not retry loop.
-- Use the official `anthropic` SDK if possible — it has correct retry semantics baked in. If rolling your own, mirror its behaviour.
+- **One long-lived writer connection** owned by a background task + an asyncio.Queue for write ops. All writes serialised through it.
+- **A small pool of read connections** (2-4) reused across requests.
+- Set PRAGMAs once at connection open: `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`, `foreign_keys=ON`.
+- Alternatively use SQLAlchemy 2.x async (`create_async_engine("sqlite+aiosqlite:///...", pool_size=5, max_overflow=0)`).
+- Never call sync `sqlite3` from an async handler — blocks the event loop.
 
 **Warning signs:**
-- Multiple envelopes in `attempts >= 5` state.
-- Anthropic dashboard shows spikes of failed requests.
-- TUI shows "queued" for extended periods with no progress.
+- Intermittent `database is locked`.
+- Latency spikes proportional to concurrent write load.
+- `PRAGMA journal_mode` returns `delete` — WAL was never enabled.
 
-**Phase to address:**
-Phase 4 (Queue + retry policy) — do this before Phase 5 goes to real API.
+**Phase to address:** Phase 1 (Persistence layer).
+
+---
+
+### Pitfall 13: aiosqlite + FastAPI test isolation (in-memory DB per event loop)
+
+**What goes wrong:**
+Tests use `:memory:` SQLite. First test passes; second test sees prior data or gets `no such table` because a new event loop got a fresh in-memory DB.
+
+**Why it happens:**
+`:memory:` databases are per-connection. Different connections (or the same connection across different event loops) see different DBs. pytest-asyncio's default `loop_scope="function"` closes loops per test.
+
+**How to avoid:**
+- Use `file::memory:?cache=shared` URI with `uri=True`, or a tempfile DB per test session.
+- Set pytest-asyncio `loop_scope="session"` and truncate tables between tests.
+- Never share aiosqlite connections across event loops.
+
+**Warning signs:**
+- Tests pass individually, fail when run together.
+- `no such table` errors only in CI.
+
+**Phase to address:** Phase 1 (Persistence layer) — nail testing pattern before schema grows.
+
+---
+
+### Pitfall 14: Fernet key stored as a config value
+
+**What goes wrong:**
+The Fernet key ends up in `.env.example`, or logged during startup, or included in a support bundle. Anyone with read access to config now has read access to every stored secret.
+
+**Why it happens:**
+- Fernet keys look like innocuous base64 strings; the API accepts them as `str`.
+- `python-dotenv` loads them alongside non-secret config.
+- Startup logs often dump all config for debugging.
+
+**How to avoid:**
+- Load the key from a **path** (`WARREN_FERNET_KEY_FILE=/etc/warren/keys/current`), not an env var. File mode `0400`, owned by warren user.
+- Redacting formatter for any config value whose name contains `KEY|SECRET|TOKEN`.
+- Leave `.env.example` empty for that field; error clearly if unset.
+- Generate the key at install time via `Fernet.generate_key()` and write to the file — never let the user paste one.
+
+**Warning signs:**
+- Fernet key appears in `git log -p`, `podman inspect`, `ps auxe`, or any log file.
+- Key file is world-readable.
+
+**Phase to address:** Phase 2 (Secret management).
+
+---
+
+### Pitfall 15: No Fernet key rotation path baked in
+
+**What goes wrong:**
+Six months in, the key needs rotation (staff departure, leak, compliance). Every stored ciphertext was encrypted with a single key with no version tag — rotation requires downtime + full re-encrypt migration. Destroy the old key too early and ciphertexts become unrecoverable.
+
+**Why it happens:**
+Fernet has `MultiFernet` for exactly this, but tutorials use plain `Fernet`. Rotation is "future work" that never happens.
+
+**How to avoid:**
+- Use `MultiFernet([current, previous])` from day 1. Decryption tries keys in order; encryption always uses the first.
+- Prefix ciphertexts with a key-id (Fernet's token includes a timestamp but not a key-id — wrap it: `f"v1:{fernet.encrypt(x)}"`).
+- Store key metadata (created_at, retired_at) in DB or a keys directory.
+- CLI subcommand `warren rotate-key`: (1) generate new key, (2) new = current + old = previous, (3) walk DB re-encrypting rows, (4) drop old key.
+- Never delete an old key until re-encryption is verified complete.
+
+**Warning signs:**
+- Only one key file has ever existed.
+- No test covers "decrypt data encrypted with a previous key."
+
+**Phase to address:** Phase 2 (Secret management).
+
+---
+
+### Pitfall 16: Fernet — encrypting the wrong things
+
+**What goes wrong:**
+Two symmetric failures:
+1. **Over-encrypting**: workspace names, timestamps, git URLs are Fernet-encrypted. Cannot query "list workspaces where git_url = X" without decrypting every row. Unindexable data store.
+2. **Under-encrypting**: encrypted secret payload is stored, but metadata (`secret_name=OPENAI_API_KEY`, `provider=openai`, `last_used_at`) reveals what the user has connected to. Workspace env templates list every secret name in plaintext.
+
+Also: Fernet is authenticated (HMAC-SHA256) and uses a random IV per encrypt — encrypting the same plaintext twice yields different ciphertexts. Devs try to use it for equality checks/dedup and get burned. IV reuse is not a risk here, but re-encrypting-then-comparing is broken.
+
+**Why it happens:**
+"Encrypt everything sensitive" without a threat model. Fields needed for querying get encrypted anyway.
+
+**How to avoid:**
+- Explicit list of encrypted fields: **secret values only.** Names, provider hints, workspace metadata stay plaintext.
+- Never index or WHERE-clause on a ciphertext column.
+- For "does this secret already exist?" checks, use an HMAC (with a separate key) stored alongside the ciphertext — not the ciphertext itself.
+- Log a WARN if any code path decrypts more than N rows in a single request (bulk decrypt = design smell).
+
+**Warning signs:**
+- Queries that decrypt every row.
+- Migration adds an "index on encrypted_col" — reject.
+- Bug reports about "search doesn't find my workspace by name".
+
+**Phase to address:** Phase 2 (Secret management) — schema design.
+
+---
+
+### Pitfall 17: FastAPI async endpoint calls blocking subprocess
+
+**What goes wrong:**
+Handler does `subprocess.run(["podman", "create", ...], capture_output=True)`. Blocks the event loop for 200ms-2s per call. Under any concurrency, throughput collapses and unrelated requests time out.
+
+**Why it happens:**
+`subprocess` is sync. `async def` does not make it async. Devs assume `async def` runs everything off-thread.
+
+**How to avoid:**
+- Use `asyncio.create_subprocess_exec(...)` throughout. `await proc.communicate()`.
+- For unavoidable sync code, wrap in `await asyncio.to_thread(func)` (Python 3.9+).
+- No first-class async Podman SDK exists — `podman-py` is sync; wrap in `to_thread` or shell out with `create_subprocess_exec`.
+- Lint rule: no bare `subprocess.` inside `async def`.
+
+**Warning signs:**
+- p99 latency correlates with concurrent request count.
+- Health check endpoint times out when a workspace is starting.
+
+**Phase to address:** Phase 1 (Runtime foundation).
 
 ---
 
@@ -305,150 +416,144 @@ Phase 4 (Queue + retry policy) — do this before Phase 5 goes to real API.
 
 | Shortcut | Immediate Benefit | Long-term Cost | When Acceptable |
 |----------|-------------------|----------------|-----------------|
-| Sync `requests` for the probe "because it's just a health check" | 3 lines of code | Freezes TUI when probe target is slow; async pattern gets muddled | Never — use `httpx.AsyncClient` from day one |
-| Non-atomic `write_text` for session persistence | Simpler write path | Data loss on any unclean shutdown (frequent on battery-powered Jetson) | Never in production; ok in throwaway prototypes |
-| Store API key in `config.toml` | One less env var to set | Key leaks via git commit, screen share, bug report | Only in local-dev with a scoped/limited key |
-| Skip the human-confirms-context-doc step | Faster phase transitions | Silent summarisation drift; wrong plans; hard to detect | For non-plan cloud phases (execute/verify) with warning banner; never for plan |
-| No debounce on connectivity probe | Fewer moving parts | Queue thrash on marginal networks (very common on LoRa/hotspot) | Never — even a 2-sample debounce is cheap |
-| Log full `httpx.Request` for debugging | Fast diagnosis | Key leakage | Only behind an off-by-default `--debug-unsafe` flag |
-| Use JetPack's system Python | No extra install step | ARM64 wheel gaps, no upgrade path | Never — always pyenv/uv |
-| Global `ollama-python` sync client | Familiar API | Blocks event loop | Never in the TUI process |
-| No index/archive on sessions dir | No cleanup code | Startup slows to seconds over months | For prototypes with <100 sessions expected |
-| One giant `App` class in Textual | Faster start | Untestable; state bleeds across screens | Weekend spike only |
+| Skip startup reconciliation | Ship faster | Every crash orphans a container; user distrust | Never — first-week feature |
+| Env-var-only secret injection (no tmpfs option) | Simple, one code path | `podman inspect` leaks; retrofit breaks clients | v0 dev prototype only |
+| Single Fernet key, no MultiFernet | 5 lines less code | Rotation needs downtime + full re-encrypt migration | Never — MultiFernet same complexity |
+| One aiosqlite connection per request | Familiar Django/Flask pattern | `database is locked` under any real load; WAL not set | Never — pool from day 1 |
+| `subprocess.run` for container ops | "Async is complicated" | Event loop stalls; latency scales with concurrency | Prototype/CLI-only paths |
+| No event `seq` on NDJSON stream | Simpler payload | No reconnect resume; users lose output on WiFi blip | Single-process demo only |
+| `255.255.255.255` broadcast without interface filter | 3 lines of code | Broken on any host with Docker/Tailscale/VPN | Never on real hardware |
+| No `--init` on containers | One less flag | Zombies; `stop` hangs; file locks leak | Never (zero cost) |
+| Plain `git worktree add` without a lock | Simpler code | Corruption under concurrent fetch; recovery painful | Only if strictly single-workspace |
+| Log `subprocess` argv for debugging | Easy debug | Secret leak whenever args contain secrets | Redacted argv only |
 
 ## Integration Gotchas
 
 | Integration | Common Mistake | Correct Approach |
 |-------------|----------------|------------------|
-| **Ollama** | Assuming `/v1/chat/completions` OpenAI-compat endpoint is identical | It's close but not 100% — `logprobs`, some `response_format` variants, and function-calling semantics differ. Test the specific fields you use against Ollama, not against OpenAI docs. |
-| **Ollama** | Not setting `keep_alive` per-request | Ollama unloads models after ~5min idle. Pass `"keep_alive": "24h"` (or `-1`) in local phases to keep VRAM warm. |
-| **Ollama** | Not handling `model not found` on first run | Detect 404 with "model not found" message → prompt user or auto-`ollama pull`; don't crash. |
-| **Anthropic** | Using `max_tokens` too low and truncating mid-stream | Anthropic requires `max_tokens`; setting it low silently truncates. Use `stop_reason` to detect and continue. |
-| **Anthropic** | Ignoring the `input_tokens` cache-control fields | Structured system prompts benefit hugely from prompt caching — set `cache_control` on the context doc block. |
-| **Anthropic SSE** | Treating each SSE `event` as a full message | Anthropic sends `content_block_start`/`_delta`/`_stop`/`message_stop` — you must reassemble deltas. |
-| **httpx** | Creating a new `AsyncClient` per request | Blows connection pooling; TLS handshake per call. Keep a module-level or app-scoped client, close in `on_unmount`. |
-| **Reticulum / rnsh** | Assuming it behaves like TCP | LoRa is high-latency (seconds), low-bandwidth (kbps), lossy. Streaming responses over LoRa is often impractical — prefer non-streaming, small-payload paths, and accept queued (not real-time) delivery. |
-| **Reticulum** | Not budgeting for airtime / duty cycle regulations | Depending on region (EU 868MHz has 1% duty cycle limits) you cannot send large payloads continuously. Design around bounded message size. |
-| **Systemd on Jetson** | Running the harness as root | Sessions end up in `/root/.cyberharness/`, users can't inspect. Run as normal user with a `User=` in the unit. |
-| **YAML workflow queue** | Using `yaml.load()` (unsafe) | Use `yaml.safe_load` — YAML files may be user-editable and arbitrary tag execution is a footgun. |
-| **YAML** | Assuming stable ordering | Dumping to YAML then reading back can reorder keys. If ordering matters (e.g., queue FIFO), use JSON or an explicit `sequence` field. |
+| Podman rootless | Assume same behaviour as root Podman | Preflight subuid/subgid, storage driver, port range |
+| Podman vs Docker | Hard-code `docker` CLI | Abstract runtime; detect `podman`/`docker`; different flag semantics (e.g. `--userns`) |
+| nsjail | Treat as drop-in for container | No image layer; runs a binary in a namespace — bring your own rootfs |
+| Tailscale | Advertise `tailscale0` IP as "your address" | Explicit interface config; MagicDNS on tailnet |
+| Docker bridge | Assume `172.17.0.0/16` is always reachable | Never rely on bridge subnet for peer connectivity |
+| SQLite WAL | Enable WAL, forget `synchronous=NORMAL` and `busy_timeout` | Set all three together at connection open |
+| Fernet | Store key in env var, log config at startup | Key file `0400`; startup log redaction |
+| FastAPI streaming | Wrap `StreamingResponse` in GZipMiddleware | Exclude stream routes from gzip; `X-Accel-Buffering: no` |
+| Git worktree | `rm -rf` a worktree directory | `git worktree remove` first, then prune |
+| `subprocess` in async | `subprocess.run()` in `async def` | `asyncio.create_subprocess_exec` |
 
 ## Performance Traps
 
 | Trap | Symptoms | Prevention | When It Breaks |
 |------|----------|------------|----------------|
-| Redrawing entire Textual RichLog on every token | UI stutters mid-stream, CPU spikes | Append via `RichLog.write(...)` (incremental) rather than reconstructing the widget's content | Immediately on Jetson (weaker CPU) for streams > 5 tok/s |
-| Re-serialising full session on every turn | Disk writes grow linearly with session length; sudden pause at end of long chats | Append-only journal (JSONL) or write only the delta; snapshot every N turns | Sessions > ~50 turns on SD card |
-| Polling probe with tight interval | Battery drain, radio wake-ups | 30s+ default (as designed), backoff further on stable-connected | Battery mode / mobile |
-| Loading all session files on startup to find active ones | Slow launch after weeks of use | Maintain sessions index, or use dedicated `active/` subdir | ~1000 sessions |
-| Sync `json.dumps` on 10k-message history | UI freeze at end of long chat | `asyncio.to_thread(json.dumps, ...)`; consider msgspec | Discuss sessions > ~1000 turns (rare but possible for long research sessions) |
-| Ollama running on CPU when GPU available | Inference at 2-3 tok/s | Verify `nvidia-smi` shows ollama; set `CUDA_VISIBLE_DEVICES` | Immediately — 10x slowdown |
-| Queue drained sequentially with no parallelism cap | First envelope takes 60s, blocks 20 more | Concurrent drain with semaphore (e.g., 2-3 in flight) | Queue depth > ~5 |
-| Not compressing archived sessions | Disk fills over months | gzip on archive move | Months of use on 32GB SD card |
+| Podman `vfs` storage instead of overlay | Container starts take minutes; disk explodes | Preflight; require `fuse-overlayfs` | Immediately, on first container |
+| Sync `subprocess.run` in async handler | Latency spikes with concurrency | `asyncio.create_subprocess_exec` | >2 concurrent workspace ops |
+| SQLite writer contention | `database is locked` | Single writer + queue; WAL mode | ~5-10 concurrent writes/sec |
+| NDJSON buffered by proxy/gzip | Streams arrive in bursts | Disable gzip on streams; `X-Accel-Buffering: no` | Any reverse proxy in path |
+| Discovery broadcast loops (no dedupe) | CPU pegged from packet flood | Install UUID dedupe + interface filter | 3+ peers on same subnet |
+| Fernet bulk-decrypt on list endpoints | List latency scales with row count | Encrypt only secret values, not metadata | ~100+ workspaces |
+| No connection pool for aiosqlite readers | Cold connections re-set PRAGMAs | Small persistent read pool | Any real traffic |
+| Fetch inside global worktree lock | All git ops serialised globally | Lock scope = bare repo only; reads unlocked | Multi-workspace pull-heavy loads |
+| slirp4netns network mode | Poor throughput/latency | `--network=pasta` (Podman 4.4+); UDS for internal streams | Bulk file ops or high-bandwidth streams |
 
 ## Security Mistakes
 
 | Mistake | Risk | Prevention |
 |---------|------|------------|
-| API keys in config file / env in dotfiles committed to git | Key exfiltration | Use OS keyring (`python-keyring`) or env-only; add `.env` and `~/.cyberharness/config.toml` to shipped `.gitignore` guidance |
-| World-readable session files (contain user prompts, possibly secrets pasted in) | Local privilege escalation reads sensitive prompts | `chmod 0700` on `~/.cyberharness/`, `0600` on files; enforce in code with `os.umask(0o077)` at startup |
-| Session/context docs synced to cloud backup unencrypted | Leaks proprietary work | Document this behaviour clearly; recommend excluding `~/.cyberharness/` from iCloud/Dropbox/etc; optional at-rest encryption via age/fernet |
-| Trusting response content into eval / shell / file paths | RCE if a model is prompt-injected | Never `eval` model output; sanitise paths; if executing suggested commands (GSD execute phase), require explicit user confirm per command |
-| YAML workflow files with `!!python/object` tags | Arbitrary code execution | `yaml.safe_load` only, never `yaml.load` |
-| Following redirects on the connectivity probe | Probe endpoint captured → leak of "I'm online" fingerprint or SSRF-adjacent behaviour | `follow_redirects=False`, probe a known IP, not a hostname owned by a third party |
-| Prompt injection via included files / context doc | Model exfiltrates data or ignores instructions | Treat all non-user content as untrusted; use Anthropic's system prompt for hard instructions; consider a "guard" prompt structure |
-| Cloud model sees the raw discuss history including keys pasted in | Key exposure | Summarisation step should redact patterns matching common key formats (`sk-`, `ghp_`, `AKIA`, JWTs) before doc is enqueued |
-| Log files including full messages world-readable in `/tmp` | Sensitive prompts leaked | Log to `~/.cyberharness/logs/` with 0600; rotate |
+| Env-var secrets visible in `podman inspect` | Any local admin/support tool reads secrets | Tmpfs-mounted secret files |
+| Secrets in FastAPI access logs / Sentry | Secret sprawl into log aggregators | Redacting formatter + body stripping on secret routes |
+| Fernet key in env var + config log | Master-key theft = all secrets compromised | Key file `0400`; explicit log redaction |
+| Container running as UID 0 (rootless-mapped) | Escape to user's UID on host if kernel bug | Non-root user in image; `--user` flag |
+| No cap-drop on container | CAP_NET_RAW, CAP_SYS_PTRACE enable attacks | `--cap-drop=ALL --cap-add=<minimal>` |
+| Sidecar has host network access | Container can hit warren's admin API | `--network=<workspace-net>`; deny host loopback |
+| Git repo mounted with credential helpers active | Container reads `~/.git-credentials` | Mount `.git` config subset only; no HOME leak |
+| UDP discovery replies to any source | Trivial spoofing → fake peers | Signed advertisements (HMAC) or explicit peer trust list |
+| SQLite DB file world-readable | Encrypted-secrets DB stolen; offline attacks possible | DB file `0600`, owned by warren user |
+| Fernet key derived from a passphrase | Offline brute force | Only accept `Fernet.generate_key()` output (32 bytes random) |
+| Reusing container across users (no destroy) | Prior user's tmpfs/env leaks | Destroy container on session end; no reuse across identities |
+| Logging `podman inspect` output in support bundles | Support archives contain plaintext secrets | Redact `Config.Env` before emitting bundles |
 
 ## UX Pitfalls
 
 | Pitfall | User Impact | Better Approach |
 |---------|-------------|-----------------|
-| No indication whether current response is from Ollama or Claude | User can't judge quality/latency | Persistent status bar showing `phase / model / connectivity`; per-message model tag inline |
-| "Queued" state with no progress indicator | User doesn't know if the task will ever run | Show queue depth, position, last-attempt time, next-retry ETA |
-| Silent connectivity switch mid-phase | User confusion about "why did this suddenly get slow/fast" | Explicit non-modal toast: "Reconnected — next phase will use Claude" |
-| Streaming with no cancel key | User is stuck waiting for a bad response | Bind Esc / Ctrl-C to cancel current stream, mark turn `cancelled` in session |
-| Resumption prompt with no preview | User can't remember which session was which | Show phase, started_at, first user message (truncated), turn count |
-| Auto-summarisation with no visibility | User trusts a possibly-wrong doc | Confirmation UX (see Pitfall 6) |
-| Errors surfaced as raw stack traces | User can't act | Human-readable error panel with next-step suggestion ("Ollama not running — start with `sudo systemctl start ollama`") |
-| No copy path for context doc | User can't hand it to another tool | Bind key to copy context doc to clipboard / write to `-` stdout |
-| First-run without visible model download progress | User thinks harness is broken | Explicit setup screen showing `ollama pull` progress |
-| No offline indicator | User tries a cloud phase, waits, sees a queue message minutes later | Header shows connectivity state at all times; block cloud phase attempts with clear "queued for reconnect" confirm |
+| Silent container startup failures | "Why isn't my workspace up?" — no feedback | Stream provision events over NDJSON from `POST /workspaces` |
+| No workspace status endpoint | Client polls, gets stale data | `GET /workspaces/<id>` with live state + last event seq |
+| Destroy returns 200 immediately, container still tearing down | User creates new one, hits port conflict | Wait for actual removal, or 202 + status URL |
+| Peer discovery lists "self" | Confusing UI showing localhost as peer | Filter own install UUID |
+| Secret rotation without ack from workspaces | Old secret still in running containers | Emit event to sidecar; require ack or restart |
+| Log output truncated mid-line on reconnect | JSON parse errors client-side | Server buffers by complete NDJSON lines only |
+| Long-running fetch blocks entire git subsystem | User creates workspace, waits for unrelated fetch | Per-repo lock, not global |
 
 ## "Looks Done But Isn't" Checklist
 
-- [ ] **Session persistence:** Session survives `kill -9` mid-turn — verify by killing during a stream, restarting, checking `state: active` file is valid JSON and resumable.
-- [ ] **Connectivity probe:** Handles captive portal WiFi (probe returns 200 from portal, not from real target) — verify by testing against a captive network or `probe_host` mismatch.
-- [ ] **Queue drain:** Handles envelope for a session whose local file has been deleted — verify graceful skip + dead-letter.
-- [ ] **Model router:** Handles Ollama returning 503 (loading) — verify retry-with-backoff, not crash.
-- [ ] **Streaming:** Handles server closing connection mid-stream — verify last partial token is persisted and turn marked incomplete.
-- [ ] **Summarisation:** Handles a discuss session with <2 turns — verify no crash, sensible short doc or skip.
-- [ ] **TUI:** Handles terminal resize during streaming — Textual usually handles this, but custom widgets can misbehave.
-- [ ] **TUI:** Handles very long single messages (multi-screen) — verify scrolling works, doesn't lock rendering.
-- [ ] **Config:** Missing config file / missing keys → sensible defaults + clear error, not stack trace.
-- [ ] **Config:** Config file present but Ollama host unreachable → probe reports it correctly, user gets actionable message.
-- [ ] **Retry:** Envelope in `attempts=5` state still visible to user with option to give up / edit / retry manually.
-- [ ] **Auth:** Missing `ANTHROPIC_API_KEY` → refuses cloud phase with clear message, doesn't leak "None" into headers.
-- [ ] **Time:** All timestamps UTC ISO-8601 with `Z`, not local time (Jetson clocks drift when offline — pair with NTP-on-reconnect).
-- [ ] **Concurrency:** Two harness processes started accidentally → detects via lockfile / socket, second refuses to start.
-- [ ] **Uninstall:** Clear path to remove `~/.cyberharness/` — documented, and no orphan systemd services.
-- [ ] **Jetson thermal:** Under sustained load, does the CLI degrade gracefully as Jetson throttles? — bench at `nvpmodel` low-power mode.
+- [ ] **Container lifecycle:** verify orphan cleanup on `kill -9 <server>; restart` — not just graceful shutdown.
+- [ ] **Secret injection:** grep `podman inspect` output for the raw secret; check `/proc/<pid>/environ`; check journalctl.
+- [ ] **Fernet:** verify `MultiFernet` path with a synthetic "old key" — decrypt succeeds, encrypt uses new key.
+- [ ] **Fernet key file perms:** confirm `0400`, owned by warren user, not world-readable.
+- [ ] **NDJSON streaming:** run through nginx/Traefik with default config; confirm events arrive within 100ms of emission.
+- [ ] **NDJSON reconnect:** kill client mid-stream, reconnect with `?since=`, verify no gaps and no duplicates.
+- [ ] **UDP discovery:** run on host with Docker AND Tailscale up; verify advertised IP is LAN, not tailnet or bridge.
+- [ ] **aiosqlite:** run 50 concurrent write requests; verify no `database is locked` and latency stays flat.
+- [ ] **Git worktrees:** run parallel fetch + checkout on 3 worktrees of same bare; verify no corruption via `git fsck`.
+- [ ] **Podman preflight:** boot on fresh VM without subuid entries — warren must error clearly, not silently `vfs`-fallback.
+- [ ] **`--init` flag:** kill a long-running child inside sidecar; verify `podman stop` returns in < 2s.
+- [ ] **Log redaction:** insert a known fake secret into a request; grep every log destination — must not appear.
+- [ ] **Sidecar signal handling:** SIGTERM the sidecar; verify child procs terminated (no zombies).
+- [ ] **Async subprocess:** grep codebase for `subprocess.run\|subprocess.check_` inside `async def` — must be zero.
 
 ## Recovery Strategies
 
 | Pitfall | Recovery Cost | Recovery Steps |
 |---------|---------------|----------------|
-| Corrupt session JSON | LOW | Restore from `.bak`, or rebuild from journal, or move to `corrupt/` and start fresh with a warning |
-| Runaway queue retries | LOW | Stop harness, `jq` to bump `attempts` beyond cap or delete stuck envelopes, restart |
-| API key leaked in a committed session | MEDIUM | Rotate key immediately in Anthropic console; git-filter-repo or BFG to purge; audit usage logs |
-| Bad summary produced wrong plan | LOW–MEDIUM | Re-open discuss session, edit context doc manually, re-enqueue plan |
-| Session dir grew huge and startup is slow | LOW | Archive script: move everything >30 days to `archive/`, rebuild index |
-| Model eviction causing 30s stalls | LOW | Set `keep_alive=-1`, enable model preload on startup |
-| Ollama on CPU not GPU | LOW | Restart Ollama with correct `CUDA_VISIBLE_DEVICES`; verify with `ollama ps` |
-| ARM64 install failure at user site | MEDIUM | Pin to known-good `requirements-jetson.txt`; ship a `uv`-based install script; offer container fallback |
-| Textual TUI hangs on quit | LOW | SIGKILL, add shutdown hook fix, ship patch — no persistent damage if atomic writes are in place |
-| Retry storm hit Anthropic rate limit | MEDIUM | Circuit breaker kicks in; pause queue for cooldown window; user can manually retry after |
-| Prompt injection in a discuss session | MEDIUM–HIGH | Isolate session, audit any tool/exec calls that ran, rotate any secrets that were in scope |
-| SD card wear-out / corruption | HIGH | Sessions on SD is fine if archived/rotated; recommend external SSD for `~/.cyberharness/` on heavy users |
+| Orphaned containers after crash | LOW | `podman ps -a --filter label=warren.server_instance=<id>`, adopt or `podman rm -f` |
+| Corrupted bare repo | MEDIUM | Reclone from origin into new bare; `git worktree repair` on each worktree; verify `git fsck` |
+| Fernet key lost | HIGH | Encrypted rows unrecoverable; require re-entry of every secret; user-visible outage |
+| `database is locked` cascade | LOW | Restart server; ensure WAL + `busy_timeout`; move to writer-queue |
+| Duplicate peer entries from UDP loops | LOW | Restart discovery with interface allowlist; purge peers table |
+| Leaked secret in logs | HIGH | Rotate every leaked credential upstream; purge log aggregator; audit access |
+| Wrong graph driver (`vfs`) | MEDIUM | Stop server; move `~/.local/share/containers` aside; install `fuse-overlayfs`; re-pull images |
+| Sidecar PID 1 zombies | LOW | Restart container with `--init`; no data loss |
+| Encrypted-field-as-index performance rot | MEDIUM | Add plaintext hash column; backfill; drop encrypted-field query paths |
+| Stale `git worktree` metadata | LOW | `git worktree prune`; if directories missing, `git worktree repair` |
 
 ## Pitfall-to-Phase Mapping
 
-Suggested phase structure (informs roadmap ordering):
-
-- **Phase 0:** Project scaffolding — deps, install, keyring, permissions
-- **Phase 1:** Textual TUI shell + async foundations + probe
-- **Phase 2:** Router + Ollama integration
-- **Phase 3:** Session manager (persistence + summarisation)
-- **Phase 4:** Offline queue + retry policy + drain
-- **Phase 5:** Claude API integration + streaming
-- **Phase 6:** GSD phase hooks + polish
-
 | Pitfall | Prevention Phase | Verification |
 |---------|------------------|--------------|
-| 1. Blocking event loop | Phase 1 | Textual `--dev` shows no blocked-loop warnings; latency test during streaming |
-| 2. `_model` leaking to wire | Phase 2 | Unit test `to_wire()` strips all `_`-prefix keys; integration test against Anthropic 400s |
-| 3. Torn session JSON | Phase 3 | Chaos test: `SIGKILL` mid-write in a loop, verify all files parse |
-| 4. Connectivity flapping | Phase 4 | Simulated flapping test (probe stub toggling), assert single-flight drain |
-| 5. Streaming frame parsing | Phase 2 (Ollama) & Phase 5 (Anthropic) | Fragmented-chunk mock test; last-token integrity assertion |
-| 6. Summarisation drift | Phase 3 | Confirmation UX is present; test with known-bad summariser producing empty sections |
-| 7. Ollama cold start / CPU fallback | Phase 2 + Phase 0 | Startup shows model warm; `ollama ps` check; benchmark ≥ 20 tok/s on Jetson Orin |
-| 8. Unbounded sessions dir | Phase 3 | Index file exists; startup time benchmark with 1000 seeded sessions |
-| 9. API key leakage | Phase 0 & Phase 5 | grep-scan CI on session/log fixtures; keyring integration test |
-| 10. ARM64 wheel gaps | Phase 0 | CI runs `pip install` under `--platform linux/arm64` |
-| 11. Shutdown leaves workers | Phase 1 | Test: `q` from any state returns to shell within 2s; no pending-task warnings |
-| 12. Retry storm on 429/529 | Phase 4 | Fault-injection test with 429 responses; assert backoff obeys retry-after + jitter |
+| Leaked containers on restart (#1) | Phase 1 — Runtime foundation | `kill -9` server, restart, assert container count and DB state consistent |
+| PID 1 / zombie procs (#2) | Phase 1 — Runtime foundation | Grep for `--init` in runtime wrapper; `stop` latency test |
+| Secrets in inspect/logs (#3) | Phase 2 — Secret management | Test injects known token, greps all log sinks post-run |
+| Rootless subuid limits (#4) | Phase 1 — Runtime foundation | Preflight test on VM without subuid entries |
+| Overlay storage fallback (#5) | Phase 1 — Runtime foundation | Assert `podman info` graphDriver ≠ vfs at boot |
+| Rootless low-port binding (#6) | Phase 3 — Networking/proxy | Integration test uses high ports only |
+| Bare repo corruption (#7) | Phase 4 — Git/workspace | Concurrent-fetch chaos test; `git fsck` clean |
+| NDJSON buffering (#8) | Phase 3 — Streaming/proxy | End-to-end latency test through a reverse proxy |
+| NDJSON reconnect gaps (#9) | Phase 3 — Streaming/proxy | Drop-and-resume test with `?since=` |
+| UDP discovery interface confusion (#10) | Phase 6 — Peer discovery | Test on host with Docker bridge up |
+| Tailscale interface confusion (#11) | Phase 6 — Peer discovery | Test on host with `tailscale0` present |
+| aiosqlite connection thrash (#12) | Phase 1 — Persistence | Concurrent-write load test; assert no `database is locked` |
+| Test DB isolation (#13) | Phase 1 — Persistence | Full suite passes in shuffled order |
+| Fernet key exposure (#14) | Phase 2 — Secret management | Startup log inspection; file-perms assertion |
+| No key rotation (#15) | Phase 2 — Secret management | `rotate-key` command exists; MultiFernet decrypts old ciphertext |
+| Wrong things encrypted (#16) | Phase 2 — Secret management | Schema review: encrypted columns are secret values only |
+| Blocking subprocess in async (#17) | Phase 1 — Runtime foundation | Lint rule; latency-under-load test |
 
 ## Sources
 
-- Textual documentation — Workers, async patterns, `run_worker` API (textualize.io/docs). HIGH confidence — official.
-- httpx documentation — `AsyncClient`, streaming with `aiter_lines`/`aiter_bytes`. HIGH confidence — official.
-- Anthropic API docs — streaming events, retry semantics, prompt caching, idempotency. HIGH confidence — official.
-- Ollama API reference — `/api/chat`, `/api/ps`, `keep_alive` semantics. HIGH confidence — official.
-- NVIDIA Jetson developer forums — recurring reports of ARM64 wheel gaps, `nvpmodel` throttling, VRAM eviction under Ollama. MEDIUM confidence — community.
-- Reticulum Network Stack documentation — bandwidth/latency characteristics; `rnsh` usage. MEDIUM confidence — official but small ecosystem.
-- General distributed-systems folklore — exponential backoff with jitter (AWS Architecture Blog "Exponential Backoff and Jitter"), circuit breaker (Nygard, *Release It!*). HIGH confidence.
-- Personal experience with async TUI apps, SSE parsing, and atomic file writes on POSIX.
+- Podman rootless documentation: https://github.com/containers/podman/blob/main/docs/tutorials/rootless_tutorial.md — HIGH
+- `tini` / container PID 1 problem: https://github.com/krallin/tini — HIGH
+- Docker `--init` docs: https://docs.docker.com/reference/cli/docker/container/run/#init — HIGH
+- Git worktree concurrency: `git-worktree(1)` man page; Git mailing list discussions on `gc.auto` — HIGH
+- SQLite WAL + `busy_timeout`: https://www.sqlite.org/wal.html, https://www.sqlite.org/pragma.html — HIGH
+- aiosqlite (no built-in pool; per-connection PRAGMAs): https://github.com/omnilib/aiosqlite — HIGH
+- cryptography Fernet + MultiFernet: https://cryptography.io/en/latest/fernet/ — HIGH
+- FastAPI streaming + buffering: Starlette `StreamingResponse`; nginx `X-Accel-Buffering` — HIGH
+- Tailscale `100.64.0.0/10` CGNAT range: https://tailscale.com/kb/1015/100.x-addresses — HIGH
+- UDP broadcast interface selection: Linux routing behaviour for `255.255.255.255` — HIGH
+- Podman networking (`pasta` vs `slirp4netns`): https://docs.podman.io/en/latest/markdown/podman-run.1.html#network — MEDIUM
+- Personal/operational experience: rootless Podman on ARM64, orphan containers under `uvicorn --reload`, SQLite WAL under FastAPI — MEDIUM
 
 ---
-*Pitfalls research for: connectivity-aware Python AI harness (cyberharness v1.0)*
-*Researched: 2026-07-07*
+*Pitfalls research for: warren v1.0 — Python environment broker for AI agent workspaces*
+*Researched: 2026-07-12*

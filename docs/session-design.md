@@ -2,10 +2,12 @@
 
 ## Principles
 
-1. **The harness owns the session, not the model.** Context survives model switches, reboots, and connectivity changes.
+1. **The harness owns the session, not the model.** Context survives model switches, zone transitions, reboots, and rate limits.
 2. **One session per phase.** Clean boundary, predictable token cost, maps to GSD's phase structure.
-3. **Summarise before handoff.** Raw discuss turns are not sent to the cloud model. The session is summarised into a structured context doc first.
-4. **Sessions are durable.** Written to disk after every turn. Resumable.
+3. **Summarise before handoff.** Raw discuss turns are not sent to the cloud model. The session is summarised into a structured context doc first. This also reduces token cost — the Beyond sees a summary, not a raw chat transcript.
+4. **Sessions are durable.** Written to disk after every turn. Resumable across zone transitions.
+5. **Zone transitions are logged.** Every turn records which zone (Slow/Beyond) and which model handled it. Auditable after the fact.
+6. **The Slow Zone provides continuity.** When the Beyond is unavailable (offline, rate-limited, or budget-conserving), the local model keeps the session alive. Work does not stop — it shifts zones.
 
 ## Session Lifecycle
 
@@ -35,13 +37,16 @@ Standard OpenAI messages array. Both Ollama and Claude API accept this natively.
 [
   {"role": "system",    "content": "You are helping with a GSD discuss phase..."},
   {"role": "user",      "content": "I want to add auth to the API"},
-  {"role": "assistant", "content": "...", "_model": "ollama/llama3.2:3b"},
+  {"role": "assistant", "content": "...", "_model": "ollama/llama3.2:3b", "_zone": "slow"},
   {"role": "user",      "content": "JWT or session tokens?"},
-  {"role": "assistant", "content": "...", "_model": "ollama/llama3.2:3b"}
+  {"role": "assistant", "content": "...", "_model": "claude-sonnet-5",    "_zone": "beyond"},
+  {"role": "user",      "content": "What about refresh token rotation?"},
+  {"role": "assistant", "content": "...", "_model": "ollama/llama3.2:3b", "_zone": "slow", "_reason": "rate_limited"}
 ]
 ```
 
-`_model` is a harness-only metadata field, stripped before sending to any API.
+`_model`, `_zone`, and `_reason` are harness-only metadata fields, stripped before sending to any API.
+`_zone` is `"slow"` or `"beyond"`. `_reason` records why a zone switch occurred (optional).
 
 ## Summarisation
 
