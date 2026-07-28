@@ -245,6 +245,48 @@ if you want expandability and CUDA performance.
 
 ---
 
+### Option I — NVIDIA DGX Station (GB10 Grace Blackwell)
+**~£2,000-2,800 est. | Quiet desktop | Expandable via NVLink to second unit**
+**Status: Not yet released — expected 2026**
+
+| | |
+|---|---|
+| Memory | 128GB unified (NVLink-C2C — genuinely unified, no split-pool penalty) |
+| Bandwidth | ~4 TB/s |
+| AI performance | ~1,000 TOPS |
+| Architecture | Blackwell — best INT4/FP8 inference efficiency |
+| Max model BF16 | 70B comfortably, 120B+ with two units |
+| 70B q4 tok/s | ~200+ (estimated) |
+| 70B BF16 tok/s | ~100+ (estimated) |
+| Noise | Quiet desktop fan — not silent but not loud |
+| Power | ~300W |
+| Expandability | Second GB10 unit via NVLink → 256GB combined |
+| Ollama/vLLM | Full CUDA (Blackwell) |
+
+**Why it's compelling:** 128GB genuinely unified memory at ~4 TB/s bandwidth
+is the key number. No split-pool penalty (unlike Tiiny), no NVLink bridge
+latency (unlike multi-GPU builds). A single unit runs 70B BF16 without
+quantisation — Sonnet-adjacent quality with no compromises.
+
+**Why to be cautious:**
+- Not released as of 2026-07-28 — no confirmed UK price or ship date
+- NVIDIA consumer launches regularly slip
+- Price estimate based on DGX Spark ($3,999) positioning — if it lands
+  above ~£2,500 the value proposition weakens vs. the 2× 3090 build
+- Limited software availability for Blackwell on day one (drivers, Ollama
+  support, vLLM optimisation typically lags 1-3 months)
+
+**The case for waiting:** If it launches at £2,000-2,500, it beats the 2× 3090
+NVLink build on every metric — faster, more memory, quieter, no build complexity.
+**The case against waiting:** Could be 6-12 months away. The 3090 build works
+today, holds resale value, and can be sold when the Station ships.
+
+**Verdict:** Best option *if* it launches at the expected price. Monitor the
+announcement — if UK pricing lands ≤£2,500 it becomes the clear recommendation
+over Option E. If it prices above £3,000 the 2× 3090 build remains better value.
+
+---
+
 ## Comparison Summary
 
 | Option | Cost | VRAM | Best model | tok/s (30B q4) | Noise | Expandable |
@@ -257,9 +299,11 @@ if you want expandability and CUDA performance.
 | F — 4× Arc Pro B60 | £4,500-6,000 | 96GB | 132B BF16 | ~200 | Very loud | Intel only |
 | G — Tiiny AI | £1,100-1,600 | 80GB* | 20B (practical) | ~17 | Silent | No |
 | H — Ryzen AI Max | £1,700-1,800 | 128GB unified | 70B | ~18 | Near-silent | No |
+| **I — DGX Station GB10** | **~£2,000-2,800 est.** | **128GB unified** | **70B BF16** | **~200+** | **Quiet** | **Yes (NVLink ×2)** |
 
 *Water-cooled 3090 = silent. Air-cooled = loud.
 *Tiiny 80GB is split-pool — practical ceiling is ~20B.
+†DGX Station not yet released — price estimated, specs from NVIDIA announcements.
 
 ---
 
@@ -296,8 +340,17 @@ is ~20B but that covers everything except the Sonnet-adjacent tier.
 
 ---
 
+### Best if you can wait: Option I — DGX Station GB10 (~£2,000-2,800 est.)
+
+128GB genuinely unified at 4 TB/s, quiet, single device, expandable to 256GB.
+Beats Option E on every metric if it lands at the expected price. Monitor the
+UK launch announcement. Decision point: ≤£2,500 → buy the Station.
+\>£3,000 → buy Option E instead.
+
+---
+
 ### Best immediate action (no spend): Option C — Use existing RTX 4060
 
 Install Ollama, pull Gemma 3 12B, serve the API. Validate the full cyberharness
-stack works before spending anything. Upgrade to Option D or E when the workflow
-is proven.
+stack works before spending anything. Upgrade to Option D, E, or I when the
+workflow is proven and pricing is confirmed.
