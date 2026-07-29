@@ -354,3 +354,122 @@ UK launch announcement. Decision point: ≤£2,500 → buy the Station.
 Install Ollama, pull Gemma 3 12B, serve the API. Validate the full cyberharness
 stack works before spending anything. Upgrade to Option D, E, or I when the
 workflow is proven and pricing is confirmed.
+
+---
+
+## Cost Model: Local Hardware vs Cloud
+
+### Current cloud pricing (2026)
+
+| Model tier | Provider | Input (per 1M tokens) | Output (per 1M tokens) |
+|---|---|---|---|
+| Haiku-equivalent | Claude Haiku 4.5 | $0.80 | $4.00 |
+| Sonnet-equivalent | Claude Sonnet 5 | $3.00 | $15.00 |
+| GPT-4o mini | OpenAI | $0.15 | $0.60 |
+| Whisper STT | OpenAI | $0.006/min | — |
+
+### Estimated usage — 6 etutor devices + cyberdeck
+
+| Source | Daily tokens |
+|---|---|
+| 6 children × 2 sessions × 20 exchanges × 500 tokens | ~120,000 |
+| Cyberdeck voice queries + discuss phases | ~20,000 |
+| Whisper STT (~60 min/day across all devices) | — |
+| **Total** | **~140,000 tokens/day = ~51M tokens/year** |
+
+**Annual cloud cost at current usage:**
+
+| Routing | Annual cost |
+|---|---|
+| All Haiku (~$2.40/1M blended) | ~$122 (~£96) |
+| All Sonnet (~$9/1M blended) | ~$459 (~£360) |
+| Cyberharness mixed (80% Haiku / 20% Sonnet) | ~$190 (~£150) |
+| Whisper STT (60 min/day × 365) | ~$131 (~£103) |
+| **Realistic total (mixed + STT)** | **~£250/year** |
+
+### Breakeven analysis
+
+Hardware pays for itself when cumulative cloud savings equal the hardware cost.
+
+| Hardware | Cost | Annual electricity | Annual saving vs cloud | Breakeven |
+|---|---|---|---|---|
+| RTX 4060 (owned) | £0 | ~£80 | £170 | Immediate |
+| Single RTX 3090 | £800 | ~£120 | £130 | ~6 years |
+| 2× RTX 3090 NVLink | £2,700-3,600 | ~£180 | £70 | Never at current usage |
+| DGX Station | ~£2,200 | ~£100 | £150 | ~15 years |
+| Mac Mini M4 Pro 24GB | £1,400 | ~£50 | £200 | ~7 years |
+
+**At current usage levels, cloud wins on pure economics.** Hardware only
+breaks even if usage scales significantly.
+
+### The scaling inflection points
+
+| Daily token usage | Annual cloud cost (mixed) | Hardware payback period (3090 NVLink) |
+|---|---|---|
+| 140K (current estimate) | ~£250 | Never |
+| 500K (3.5× — more sessions, longer) | ~£900 | ~4 years |
+| 1M (7× — full use, agents, cyberharness) | ~£1,800 | ~2 years |
+| 2M (14× — production scale) | ~£3,600 | ~1 year |
+
+**Inflection point for the 3090 build: ~700K tokens/day.** Below that, cloud
+is cheaper. Above that, hardware pays off within 3 years.
+
+### The inflation scenario
+
+Cloud AI pricing has deflated ~95% over 2023-2026 for commodity tiers.
+This deflationary trend may not continue if:
+- Frontier model quality diverges further from open-weight models
+- Regulatory compliance costs for children's data processing increase
+- The commodity inference market consolidates
+
+If cloud prices inflate 5× from current levels:
+
+| Daily tokens | Annual cloud cost (5× inflation) | Hardware payback |
+|---|---|---|
+| 140K | ~£1,250 | ~2.5 years (3090 build) |
+| 500K | ~£4,500 | ~9 months |
+
+A 5× inflation scenario makes hardware investment clearly justified even
+at current modest usage.
+
+### The non-financial arguments for local
+
+These do not appear in a cost model but are real:
+
+**Privacy.** Children's educational sessions — questions asked, concepts
+struggled with, interests revealed, neurodivergence flags — are intimate
+cognitive data. Sending this to Anthropic or OpenAI servers is a meaningful
+privacy tradeoff regardless of their policies. Local inference means none
+of this leaves the house.
+
+**Offline sovereignty (Slow Zone model).** The cyberharness is designed to
+operate locally when the Beyond is unavailable. Cloud dependency breaks this
+design. A rate limit or outage during a child's session is a worse failure
+mode than slightly slower local inference.
+
+**Latency.** Cloud round-trips add 200-800ms per exchange depending on
+provider and network. For voice-based etutor sessions (speak → transcribe →
+respond → TTS), this compounds noticeably. Local inference is <50ms.
+
+**No per-token ceiling.** Socratic tutoring benefits from verbose, patient
+responses. Cloud inference creates implicit pressure to keep prompts short
+and sessions cheap. Local inference removes that pressure entirely.
+
+**Regulatory trajectory.** GDPR Article 8, COPPA, and emerging EU AI Act
+provisions create increasing compliance complexity for processing children's
+data via third-party cloud providers. Local inference sidesteps this entirely
+and is likely to become a stronger argument over time, not weaker.
+
+### Recommended approach
+
+1. **Now:** Use existing RTX 4060 + cloud routing via cyberharness.
+   Measure actual token usage for 4-6 weeks.
+
+2. **Review:** If monthly cloud bill is under £30 and privacy/offline
+   concerns are acceptable → cloud routing is fine indefinitely.
+
+3. **Upgrade trigger:** Monthly cloud bill exceeds £100, OR privacy
+   concerns harden, OR DGX Station launches at ≤£2,500.
+
+4. **Hardware choice at upgrade:** Follow the recommendation matrix above.
+   DGX Station if available and ≤£2,500. 2× RTX 3090 NVLink otherwise.
